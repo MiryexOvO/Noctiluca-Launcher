@@ -4,6 +4,7 @@ mod manager;
 mod motion;
 mod players;
 mod settings;
+mod titlebar;
 use std::{
     fs,
     path::PathBuf,
@@ -13,13 +14,13 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+pub(crate) use titlebar::title_bar;
 
 use anyhow::{Result, ensure};
 use ely_gpui_component::{
     buttons::Button,
     forms::{Input, TextInput},
     primitives::{FocusScope, Icon, IconName},
-    shell::{WindowControls, drag_region},
     theme::ActiveTheme,
 };
 use gpui::{prelude::*, *};
@@ -39,42 +40,6 @@ pub(crate) const INK: u32 = 0xf2edf5;
 const MUTED: u32 = 0xc9bfd0;
 const ACCENT: u32 = 0xd3b1e6;
 const SELECTED: u32 = 0x55475e;
-
-pub(crate) fn title_bar(
-    window: &mut Window,
-    cx: &mut App,
-    controls: WindowControls,
-) -> impl IntoElement {
-    let drag = drag_region("titlebar-drag", window, cx);
-    div()
-        .flex()
-        .flex_none()
-        .h(cx.theme().titlebar_height())
-        .bg(linear_gradient(
-            90.,
-            linear_color_stop(rgb(SIDEBAR), 0.),
-            linear_color_stop(rgb(BG), 1.),
-        ))
-        .border_b_1()
-        .border_color(rgb(LINE))
-        .child(
-            drag.flex_1()
-                .h_full()
-                .pl_3()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(Icon::new(IconName::Layers).color(rgb(ACCENT)))
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(INK))
-                        .child(crate::APP_NAME),
-                ),
-        )
-        .child(controls)
-}
 
 pub fn apply_palette(cx: &mut App) {
     use ely_gpui_component::theme::{Mode, Palette, Theme};
@@ -1266,11 +1231,6 @@ impl Render for Home {
             Page::Backups => self.backups_page(cx).into_any_element(),
         };
         let view = cx.weak_entity();
-        let controls = WindowControls::new("window-controls").on_close(move |window, cx| {
-            if view.update(cx, Self::can_close).unwrap_or(true) {
-                window.remove_window();
-            }
-        });
         FocusScope::new(&self.focus)
             .root()
             .size_full()
@@ -1283,7 +1243,11 @@ impl Render for Home {
             ))
             .text_color(rgb(INK))
             .font_family("Microsoft YaHei UI")
-            .child(title_bar(window, cx, controls))
+            .child(title_bar(window, cx, move |window, cx| {
+                if view.update(cx, Self::can_close).unwrap_or(true) {
+                    window.remove_window();
+                }
+            }))
             .child(
                 div()
                     .flex()

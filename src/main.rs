@@ -85,11 +85,9 @@ impl Render for StartupError {
             .flex_col()
             .bg(rgb(ui::BG))
             .text_color(rgb(ui::INK))
-            .child(ui::title_bar(
-                window,
-                cx,
-                ely_gpui_component::shell::WindowControls::new("window-controls"),
-            ))
+            .child(ui::title_bar(window, cx, |window, _| {
+                window.remove_window()
+            }))
             .child(
                 div()
                     .p_8()
