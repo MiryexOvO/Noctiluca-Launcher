@@ -1,4 +1,5 @@
 pub mod icon;
+pub mod status;
 use crate::{
     download::{self, Downloads},
     library::{Loader, safe_id},
@@ -87,6 +88,7 @@ pub struct Release {
     pub sha1: String,
     pub filename: String,
     pub size: Option<u64>,
+    pub metadata: status::Metadata,
 }
 impl Release {
     pub fn archive(&self, root: &Path, downloads: &Downloads) -> Result<PathBuf> {
@@ -138,6 +140,11 @@ struct Version {
     id: String,
     name: String,
     version_number: String,
+    #[serde(default)]
+    game_versions: Vec<String>,
+    #[serde(default)]
+    loaders: Vec<String>,
+    date_published: Option<String>,
     files: Vec<PackAsset>,
 }
 #[derive(Deserialize)]
@@ -240,7 +247,7 @@ pub fn files(
 ) -> Result<Vec<Release>> {
     let loader = loader.filter(|_| kind.uses_loader());
     if source == Source::CurseForge {
-        return crate::curse::releases(kind, loader, mc, project);
+        return crate::curse::releases(kind, loader, mc, project, false);
     }
     ensure!(safe_id(project), "项目编号无效");
     let mut request = download::client()?.get(format!(
@@ -266,6 +273,12 @@ pub fn files(
                 sha1: file.hashes.sha1,
                 filename: file.filename,
                 size: file.size,
+                metadata: status::Metadata {
+                    version: v.version_number,
+                    games: v.game_versions,
+                    loaders: v.loaders,
+                    published: v.date_published.and_then(|s| s.parse().ok()),
+                },
             })
         })
         .collect())
@@ -385,6 +398,23 @@ pub fn install_file(
     cancel: &std::sync::atomic::AtomicBool,
     report: impl Fn(String) + Sync,
 ) -> Result<()> {
+    install_choice(root, item, kind, file, None, cancel, report)
+}
+
+pub struct Selection {
+    pub catalog: std::sync::Arc<status::Catalog>,
+    pub seen: Vec<status::LocalFile>,
+}
+
+pub fn install_choice(
+    root: &Path,
+    item: &crate::library::Instance,
+    kind: Kind,
+    file: &Release,
+    selection: Option<&Selection>,
+    cancel: &std::sync::atomic::AtomicBool,
+    report: impl Fn(String) + Sync,
+) -> Result<()> {
     let _lock = crate::library::lock_instance(root, item, "实例正在使用，请稍后重试")?;
     let current: crate::library::Instance =
         serde_json::from_slice(&std::fs::read(item.path(root).join("instance.json"))?)?;
@@ -397,8 +427,23 @@ pub fn install_file(
     );
     let d = Downloads::new(cancel, &report)?;
     d.check()?;
+    let game = current.game_dir(root)?;
+    if let Some(choice) = selection {
+        let found = choice.catalog.scan(&game)?;
+        ensure!(found == choice.seen, "目标实例的文件已变更，请重新选择版本");
+        if found
+            .iter()
+            .any(|f| f.hash.eq_ignore_ascii_case(&file.sha1))
+        {
+            return Ok(());
+        }
+        if kind == Kind::Mod && !found.is_empty() {
+            ensure!(found.len() == 1, "存在多个同项目模组，请先在实例中整理");
+            return crate::mods::replace_pinned(&game.join("mods"), &current, &found[0], file, &d);
+        }
+    }
     if kind == Kind::Mod {
-        return crate::mods::install_pinned(root, &current, file, &d);
+        return crate::mods::install_pinned(&game.join("mods"), &current, file, &d);
     }
     let folder = match kind {
         Kind::Resource => "resourcepacks",

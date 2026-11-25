@@ -29,6 +29,8 @@ struct Index {
 #[derive(Deserialize)]
 pub(crate) struct PackFile {
     pub(crate) path: String,
+    #[serde(rename = "fileSize")]
+    pub(crate) size: Option<u64>,
     pub(crate) hashes: HashMap<String, String>,
     pub(crate) downloads: Vec<String>,
     #[serde(skip)]
@@ -265,6 +267,7 @@ pub struct Preview {
     archive: File,
     prefixes: Vec<String>,
     cache: tempfile::TempDir,
+    cached_sizes: std::sync::Mutex<Vec<Option<u64>>>,
 }
 
 impl PackFile {
@@ -384,6 +387,7 @@ pub fn preview(root: &Path, path: &Path) -> Result<Preview> {
         required_count = files.len() - optional_count;
     }
     Ok(Preview {
+        cached_sizes: std::sync::Mutex::new(vec![None; files.len()]),
         instance,
         files,
         curse: curse.is_some(),
@@ -411,7 +415,43 @@ pub fn preview(root: &Path, path: &Path) -> Result<Preview> {
     })
 }
 
+#[derive(Default)]
+pub struct DownloadEstimate {
+    pub cached_count: usize,
+    pub cached_bytes: u64,
+    pub pending_count: usize,
+    pub pending_bytes: u64,
+    pub unknown_count: usize,
+}
+
 impl Preview {
+    pub fn estimate(&self, optional: &HashSet<usize>) -> DownloadEstimate {
+        let cached = self.cached_sizes.lock().unwrap();
+        let mut result = DownloadEstimate::default();
+        if self.metadata_error.is_some() {
+            result.pending_count = self.required_count;
+            result.unknown_count = self.required_count;
+            return result;
+        }
+        for (i, file) in self.files.iter().enumerate() {
+            if file.optional() && !optional.contains(&i) {
+                continue;
+            }
+            if let Some(bytes) = cached[i] {
+                result.cached_bytes = result.cached_bytes.saturating_add(bytes);
+                result.cached_count += 1;
+            } else {
+                result.pending_count += 1;
+                if let Some(bytes) = file.size {
+                    result.pending_bytes = result.pending_bytes.saturating_add(bytes);
+                } else {
+                    result.unknown_count += 1;
+                }
+            }
+        }
+        result
+    }
+
     fn cache_path(&self, index: usize) -> PathBuf {
         self.cache.path().join(index.to_string())
     }
@@ -432,7 +472,8 @@ impl Preview {
             !cancel.load(std::sync::atomic::Ordering::Relaxed),
             "已取消校验"
         );
-        copy.persist(self.cache_path(index))?;
+        let saved = copy.persist(self.cache_path(index))?;
+        self.cached_sizes.lock().unwrap()[index] = Some(saved.metadata()?.len());
         Ok(())
     }
 
@@ -495,7 +536,16 @@ impl Preview {
                 ensure!(destination.is_file(), "请补齐文件：{}", file.path);
             }
         }
-        downloads.batch(self.cache.path(), "整合包文件", tasks)
+        let indices: HashMap<_, _> = selected
+            .iter()
+            .map(|(i, f)| (f.path.as_str(), *i))
+            .collect();
+        downloads.batch_with(self.cache.path(), "整合包文件", tasks, |task| {
+            let i = indices[task.label.as_str()];
+            self.check_sha512(&self.files[i], &task.destination, downloads.cancel)?;
+            self.cached_sizes.lock().unwrap()[i] = Some(fs::metadata(&task.destination)?.len());
+            Ok(())
+        })
     }
 
     pub fn prefetch(&self, cancel: &AtomicBool, report: &(dyn Fn(String) + Sync)) -> Result<()> {
@@ -506,12 +556,7 @@ impl Preview {
             .enumerate()
             .filter(|(_, f)| !f.optional() && f.automatic.is_some())
             .collect();
-        self.cache_files(&downloads, &required)?;
-        for (i, file) in required {
-            self.check_sha512(file, &self.cache_path(i), cancel)
-                .with_context(|| crate::download::FileFailure::new("整合包校验", &file.path))?;
-        }
-        Ok(())
+        self.cache_files(&downloads, &required)
     }
 
     pub fn install(
@@ -550,6 +595,10 @@ impl Preview {
         for &(i, file) in &selected {
             downloads.check()?;
             let cached = self.cache_path(i);
+            if file.automatic.is_none() {
+                self.check_sha512(file, &cached, cancel)?;
+            }
+
             self.check_sha512(file, &cached, cancel)
                 .with_context(|| crate::download::FileFailure::new("整合包校验", &file.path))?;
             let dest = game.join(relative(&file.path)?);

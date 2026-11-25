@@ -82,6 +82,16 @@ impl<'a> Downloads<'a> {
     }
 
     pub fn batch(&self, root: &Path, title: &str, tasks: Vec<DownloadTask>) -> Result<()> {
+        self.batch_with(root, title, tasks, |_| Ok(()))
+    }
+
+    pub fn batch_with(
+        &self,
+        root: &Path,
+        title: &str,
+        tasks: Vec<DownloadTask>,
+        completed: impl Fn(&DownloadTask) -> Result<()> + Sync,
+    ) -> Result<()> {
         self.check()?;
         let mut seen = HashSet::new();
         let mut unique = Vec::new();
@@ -107,6 +117,7 @@ impl<'a> Downloads<'a> {
             unique.par_iter().try_for_each(|task| -> Result<()> {
                 self.check()?;
                 self.file(root, task)
+                    .and_then(|()| completed(task))
                     .with_context(|| FileFailure::new(title, &task.label))?;
                 let mut state = progress.lock().unwrap();
                 state.0 += 1;

@@ -299,6 +299,36 @@ impl Home {
                     item.version,
                     pack.required_count
                 )));
+            let estimate = pack.estimate(&draft.optional);
+            let pending = match (estimate.unknown_count, estimate.pending_bytes) {
+                (0, bytes) => format_bytes(bytes),
+                (_, 0) => "待确认".to_owned(),
+                (_, bytes) => format!("至少 {}", format_bytes(bytes)),
+            };
+            let mut transfer = panel("整合包依赖下载量").child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_3()
+                    .child(format!(
+                        "本次已缓存 {}（{} 个文件）",
+                        format_bytes(estimate.cached_bytes),
+                        estimate.cached_count
+                    ))
+                    .child(format!(
+                        "还需下载 {pending}（{} 个文件）",
+                        estimate.pending_count
+                    )),
+            );
+            if estimate.unknown_count > 0 {
+                transfer = transfer.child(kicker(&format!(
+                    "{} 个待获取文件的大小未知",
+                    estimate.unknown_count
+                )));
+            }
+            body = body.child(transfer.child(kicker(
+                "按当前选中的清单文件统计。基础游戏、加载器和 Java 在安装时单独检查。",
+            )));
             if let Some(error) = &pack.metadata_error {
                 body = body.child(panel("无法读取依赖文件信息").child(error.clone()));
                 let path = draft.path.clone();

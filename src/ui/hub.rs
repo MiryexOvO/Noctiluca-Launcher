@@ -23,6 +23,11 @@ pub(super) struct Hub {
     releases: Vec<Release>,
     project: Option<Hit>,
     target: Option<Instance>,
+    catalog: Option<Arc<market::status::Catalog>>,
+    installed: std::collections::HashMap<String, Option<market::status::Installed>>,
+    status_request: u64,
+    checking: bool,
+    check_error: Option<String>,
     result_mc: String,
     result_query: String,
     offset: usize,
@@ -74,6 +79,11 @@ impl Hub {
             releases: vec![],
             project: None,
             target: None,
+            catalog: None,
+            installed: Default::default(),
+            status_request: 0,
+            checking: false,
+            check_error: None,
             result_mc: String::new(),
             result_query: String::new(),
             offset: 0,
@@ -83,6 +93,9 @@ impl Hub {
             loading: false,
             error: None,
         }
+    }
+    pub(super) fn project_is_open(&self) -> bool {
+        self.project.is_some() && !self.is_pack()
     }
     pub(super) fn is_pack(&self) -> bool {
         self.kind == Kind::Pack
@@ -94,6 +107,11 @@ impl Hub {
         self.page = 0;
         self.target = None;
         self.project = None;
+        self.catalog = None;
+        self.installed.clear();
+        self.checking = false;
+        self.check_error = None;
+        self.status_request += 1;
         self.error = None;
     }
     pub(super) fn clear(&mut self) {
@@ -107,17 +125,7 @@ fn file_size(size: Option<u64>, label: &str) -> String {
     let Some(bytes) = size else {
         return format!("{label}大小待确认");
     };
-    if bytes < 1024 {
-        return format!("{label} · {bytes} B");
-    }
-    let (scale, unit) = if bytes >= 1 << 30 {
-        (1_u64 << 30, "GiB")
-    } else if bytes >= 1 << 20 {
-        (1 << 20, "MiB")
-    } else {
-        (1024, "KiB")
-    };
-    format!("{label} · {:.1} {unit}", bytes as f64 / scale as f64)
+    format!("{label} · {}", format_bytes(bytes))
 }
 
 fn reference_size(hit: &Hit, kind: Kind) -> Div {
@@ -262,8 +270,63 @@ impl Home {
         if self.hub.is_pack() {
             self.discover_files(None, cx);
         } else {
-            cx.notify();
+            self.inspect_targets(cx);
         }
+    }
+
+    pub(super) fn refresh_target_catalog(&mut self, cx: &mut Context<Self>) {
+        self.hub.catalog = None;
+        if self.page == Page::Hub && self.hub.project_is_open() {
+            self.inspect_targets(cx);
+        }
+    }
+
+    pub(super) fn inspect_targets(&mut self, cx: &mut Context<Self>) {
+        let h = &mut self.hub;
+        let Some(hit) = &h.project else {
+            return;
+        };
+        if h.kind == Kind::Pack {
+            return;
+        }
+        h.status_request += 1;
+        let request = h.status_request;
+        h.checking = true;
+        h.check_error = None;
+        let (source, kind, project, cached) = (h.source, h.kind, hit.id.clone(), h.catalog.clone());
+        let root = self.root.clone();
+        let items = self.instances.clone();
+        let task = cx.background_executor().spawn(async move {
+            let catalog = match cached {
+                Some(c) => c,
+                None => Arc::new(market::status::Catalog::fetch(source, kind, &project)?),
+            };
+            let found = catalog.instances(&root, &items);
+            Ok::<_, anyhow::Error>((catalog, found))
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |home, cx| {
+                let h = &mut home.hub;
+                if h.status_request != request {
+                    return;
+                }
+                h.checking = false;
+                match result {
+                    Ok((c, found)) => {
+                        h.catalog = Some(c);
+                        h.installed = found;
+                    }
+                    Err(e) => {
+                        h.check_error = Some(format!("{e:#}"));
+                        h.installed.clear();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn discover_files(&mut self, target: Option<Instance>, cx: &mut Context<Self>) {
@@ -320,6 +383,25 @@ impl Home {
             self.message(Err(anyhow::anyhow!("请退出目标实例后安装")), cx);
             return;
         }
+        let selection = self.hub.catalog.clone().and_then(|catalog| {
+            self.hub
+                .installed
+                .get(&item.id)?
+                .as_ref()
+                .map(|status| market::Selection {
+                    catalog,
+                    seen: status.files.clone(),
+                })
+        });
+        // If the full project index was unavailable, recheck the visible compatible releases
+        // before adding a file. A discovered local match requires reviewing the target again.
+        let selection = selection.unwrap_or_else(|| market::Selection {
+            catalog: Arc::new(market::status::Catalog::new(
+                self.hub.kind,
+                self.hub.releases.clone(),
+            )),
+            seen: Vec::new(),
+        });
         let kind = self.hub.kind;
         let root = self.root.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -328,10 +410,11 @@ impl Home {
         self.status = format!("正在安装到「{}」", item.name);
         let (tx, rx) = async_channel::unbounded();
         std::thread::spawn(move || {
-            let r = market::install_file(&root, &item, kind, &file, &cancel, |s| {
-                let _ = tx.try_send(Update::Status(s));
-            })
-            .with_context(|| format!("安装到「{}」失败", item.name));
+            let r =
+                market::install_choice(&root, &item, kind, &file, Some(&selection), &cancel, |s| {
+                    let _ = tx.try_send(Update::Status(s));
+                })
+                .with_context(|| format!("安装到「{}」失败", item.name));
             let _ = tx.try_send(Update::Finished(
                 r,
                 format!("{}已安装到「{}」", kind.label(), item.name),
@@ -371,6 +454,29 @@ impl Home {
                     ),
             )
             .child(kicker(&hit.description));
+        if !h.is_pack() {
+            let status = if let Some(e) = &h.check_error {
+                format!("安装状态暂不可用 · {e}")
+            } else if h.checking {
+                "正在检查实例文件…".into()
+            } else {
+                String::new()
+            };
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().child(kicker(&status)))
+                    .child(
+                        Button::new("check-installed", "重新检查安装状态")
+                            .disabled(h.checking || busy)
+                            .on_click(cx.listener(|home, _, _, cx| {
+                                home.refresh_target_catalog(cx);
+                            })),
+                    ),
+            );
+        }
         if !h.is_pack() && h.target.is_none() {
             let mut targets = panel("选择安装到哪个实例");
             if self.instances.is_empty() {
@@ -388,12 +494,32 @@ impl Home {
                 let id = item.id.clone();
                 let running = self.running.contains_key(&id);
                 let vanilla = h.kind == Kind::Mod && item.loader == Loader::Vanilla;
+                let label = h
+                    .installed
+                    .get(&id)
+                    .and_then(Option::as_ref)
+                    .map(|s| s.label())
+                    .unwrap_or_else(|| {
+                        if h.checking {
+                            "正在检查".into()
+                        } else {
+                            "状态暂不可用".into()
+                        }
+                    });
                 targets = targets.child(
                     div()
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(div().flex_1().min_w_0().child(item.name.clone()))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(item.name.clone())
+                                .child(kicker(&label)),
+                        )
                         .child(kicker(&format!(
                             "{} · {}",
                             item.version,
@@ -469,8 +595,24 @@ impl Home {
         if h.releases.is_empty() {
             return body.child(files.child(kicker("没有符合游戏版本和加载器条件的发布文件")));
         }
+        let installed = h
+            .target
+            .as_ref()
+            .and_then(|i| h.installed.get(&i.id))
+            .and_then(Option::as_ref);
+        let found = installed.map_or(&[][..], |s| s.files.as_slice());
+        if let Some(s) = installed {
+            files = files.child(kicker(&s.label()));
+        }
+        if h.kind == Kind::Mod && found.len() > 1 {
+            files = files.child(kicker("此实例已有多个同项目模组，请先在实例中整理。"));
+        }
         for (i, file) in h.releases.iter().enumerate().skip(h.page * 10).take(10) {
             let file = file.clone();
+            let already = found
+                .iter()
+                .any(|f| f.hash.eq_ignore_ascii_case(&file.sha1));
+            let replace = h.kind == Kind::Mod && !found.is_empty();
             files = files.child(
                 div()
                     .flex()
@@ -486,11 +628,15 @@ impl Home {
                             ("discovery-install", i),
                             if h.is_pack() {
                                 "预览整合包"
+                            } else if already {
+                                "已安装"
+                            } else if replace {
+                                "替换为此版本"
                             } else {
                                 "安装此版本"
                             },
                         )
-                        .disabled(busy)
+                        .disabled(busy || already || h.checking || (replace && found.len() > 1))
                         .on_click(cx.listener(move |home, _, _, cx| {
                             home.install_discovery_file(file.clone(), cx)
                         })),

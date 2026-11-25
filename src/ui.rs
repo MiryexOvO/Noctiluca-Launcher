@@ -422,6 +422,7 @@ impl Home {
                                 if home.page == Page::Files && result.is_ok() {
                                     home.browse_files(home.content.label, home.content.kind, cx);
                                 }
+                                home.refresh_target_catalog(cx);
                                 home.status = success;
                                 if matches!(home.page, Page::Mods) {
                                     home.refresh_mods(cx);
@@ -656,6 +657,8 @@ impl Home {
                         home.page = Page::Hub;
                         if !home.hub.searched && !home.hub.loading {
                             home.discover(0, false, cx);
+                        } else if home.hub.project_is_open() {
+                            home.inspect_targets(cx);
                         }
                         cx.notify();
                     })),
@@ -1259,6 +1262,20 @@ impl Home {
         })
         .detach();
     }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let (scale, unit) = if bytes >= 1 << 30 {
+        (1_u64 << 30, "GiB")
+    } else if bytes >= 1 << 20 {
+        (1 << 20, "MiB")
+    } else {
+        (1024, "KiB")
+    };
+    format!("{:.1} {unit}", bytes as f64 / scale as f64)
 }
 
 fn kicker(text: &str) -> Div {

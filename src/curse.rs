@@ -94,6 +94,7 @@ struct File {
     id: u64,
     mod_id: u64,
     display_name: String,
+    file_date: Option<String>,
     file_name: String,
     file_length: Option<u64>,
     download_url: Option<String>,
@@ -187,7 +188,13 @@ impl Project {
         }
     }
 }
-pub fn releases(kind: Kind, loader: Option<Loader>, mc: &str, id: &str) -> Result<Vec<Release>> {
+pub fn releases(
+    kind: Kind,
+    loader: Option<Loader>,
+    mc: &str,
+    id: &str,
+    include_manual: bool,
+) -> Result<Vec<Release>> {
     let (http, api) = api()?;
     let id = id.parse::<u64>()?;
     let mut releases = vec![];
@@ -209,17 +216,33 @@ pub fn releases(kind: Kind, loader: Option<Loader>, mc: &str, id: &str) -> Resul
                 && f.file_name
                     .to_ascii_lowercase()
                     .ends_with(kind.extension(Source::CurseForge))
-                && f.url().is_ok()
+                && (include_manual || f.url().is_ok())
             {
                 releases.push(Release {
                     source: crate::market::Source::CurseForge,
                     project: id.to_string(),
                     id: f.id.to_string(),
                     name: f.display_name.clone(),
-                    url: f.url()?,
+                    url: f.url().unwrap_or_default(),
                     sha1: f.sha1()?,
                     filename: f.file_name,
                     size: f.file_length,
+                    metadata: crate::market::status::Metadata {
+                        version: f.display_name,
+                        loaders: f
+                            .game_versions
+                            .iter()
+                            .filter(|v| {
+                                matches!(
+                                    v.to_ascii_lowercase().as_str(),
+                                    "fabric" | "forge" | "neoforge" | "quilt"
+                                )
+                            })
+                            .cloned()
+                            .collect(),
+                        games: f.game_versions,
+                        published: f.file_date.and_then(|s| s.parse().ok()),
+                    },
                 });
             }
         }
@@ -288,6 +311,7 @@ pub(super) fn resolve(requirements: &[Requirement], required: bool) -> Result<Ve
             );
             resolved.push(PackFile {
                 path: format!("{folder}/{}", file.file_name),
+                size: file.file_length,
                 downloads: file.download_url.clone().into_iter().collect(),
                 automatic: None,
                 hashes: HashMap::from([("sha1".into(), file.sha1()?)]),

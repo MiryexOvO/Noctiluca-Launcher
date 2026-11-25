@@ -135,19 +135,18 @@ pub fn install(
     install_modrinth(&mods, item, &hit.project_id, None, &downloads)
 }
 pub fn install_pinned(
-    root: &Path,
+    mods: &Path,
     item: &Instance,
     file: &crate::market::Release,
     downloads: &Downloads,
 ) -> Result<()> {
-    let mods = item.game_dir(root)?.join("mods");
-    fs::create_dir_all(&mods)?;
+    fs::create_dir_all(mods)?;
     match file.source {
         crate::market::Source::Modrinth => {
-            install_modrinth(&mods, item, &file.project, Some(file), downloads)
+            install_modrinth(mods, item, &file.project, Some(file), downloads)
         }
         crate::market::Source::CurseForge => {
-            install_curse(&mods, item, file.project.parse()?, Some(file), downloads)
+            install_curse(mods, item, file.project.parse()?, Some(file), downloads)
         }
     }
 }
@@ -436,38 +435,61 @@ pub fn upgrade(
 ) -> Result<()> {
     let _lock = crate::library::lock_instance(root, item, "请先退出游戏")?;
     let dir = item.game_dir(root)?.join("mods");
+    let d = Downloads::new(cancel, &report)?;
+    replace_mod(&dir, &u.old, &u.hash, &u.new, &d, |staged| {
+        if let Some(p) = u.hit.project_id.strip_prefix("cf:") {
+            install_curse(staged, item, p.parse()?, None, &d)
+        } else {
+            install_modrinth(staged, item, &u.hit.project_id, None, &d)
+        }
+    })
+}
+
+pub fn replace_pinned(
+    dir: &Path,
+    item: &Instance,
+    old: &crate::market::status::LocalFile,
+    file: &crate::market::Release,
+    d: &Downloads,
+) -> Result<()> {
+    let new = download_name(&file.project, &file.filename)?;
+    replace_mod(dir, &old.name, &old.hash, &new, d, |staged| {
+        install_pinned(staged, item, file, d)
+    })
+}
+
+fn replace_mod(
+    dir: &Path,
+    old: &str,
+    hash: &str,
+    new: &str,
+    d: &Downloads,
+    install: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     ensure!(
-        jar_name(&u.new) && jar_name(u.old.strip_suffix(".disabled").unwrap_or(&u.old)),
+        jar_name(new) && jar_name(old.strip_suffix(".disabled").unwrap_or(old)),
         "无效的模组文件名"
     );
     ensure!(
-        sha1_file(dir.join(&u.old))? == u.hash,
+        sha1_file(dir.join(old))? == hash,
         "已安装文件发生变化，请重新检查更新"
     );
-    let temp = tempfile::tempdir_in(dir.parent().unwrap())?;
+    let game = dir.parent().context("模组目录无上级")?;
+    let temp = tempfile::tempdir_in(game)?;
     let staged = temp.path().join("mods");
-    crate::backups::copy_tree(&dir, &staged)?;
-    fs::remove_file(staged.join(&u.old))?;
-    let d = Downloads::new(cancel, &report)?;
-    if let Some(p) = u.hit.project_id.strip_prefix("cf:") {
-        install_curse(&staged, item, p.parse()?, None, &d)?;
-    } else {
-        install_modrinth(&staged, item, &u.hit.project_id, None, &d)?;
-    }
-    ensure!(staged.join(&u.new).is_file(), "上游版本已更新，请重新检查");
-    if u.old.ends_with(".disabled") {
-        fs::rename(
-            staged.join(&u.new),
-            staged.join(format!("{}.disabled", u.new)),
-        )?;
+    crate::backups::copy_tree(dir, &staged)?;
+    fs::remove_file(staged.join(old))?;
+    install(&staged)?;
+    ensure!(staged.join(new).is_file(), "上游版本已更新，请重新检查");
+    if old.ends_with(".disabled") {
+        fs::rename(staged.join(new), staged.join(format!("{new}.disabled")))?;
     }
     d.check()?;
-    let game = dir.parent().context("模组目录无上级")?;
     let token = uuid::Uuid::new_v4().to_string();
     crate::library::atomic_write(&game.join(".noctiluca-mod-update"), token.as_bytes())?;
     let backup = game.join(format!("mods-before-update-{token}"));
-    fs::rename(&dir, &backup)?;
-    if let Err(e) = fs::rename(staged, &dir) {
+    fs::rename(dir, &backup)?;
+    if let Err(e) = fs::rename(staged, dir) {
         recover(game)?;
         return Err(e.into());
     }
