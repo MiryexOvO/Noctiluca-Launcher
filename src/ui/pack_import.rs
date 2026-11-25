@@ -36,7 +36,7 @@ impl Home {
                 .and_then(|v| v.to_str())
                 .is_some_and(|v| v.eq_ignore_ascii_case("zip") || v.eq_ignore_ascii_case("mrpack"))
         {
-            self.install_pack(hub::Pack::Local(path.clone()), cx);
+            self.install_pack(hub::Pack::Dropped(path.clone()), cx);
         } else {
             self.message(
                 Err(anyhow::anyhow!("请每次拖入一个 .mrpack 或 .zip 整合包")),
@@ -48,6 +48,7 @@ impl Home {
     pub(super) fn preview_ready(
         &mut self,
         result: Result<(PathBuf, Box<Preview>)>,
+        dropped: bool,
         cx: &mut Context<Self>,
     ) {
         self.cancel = None;
@@ -70,16 +71,36 @@ impl Home {
                 });
                 self.status = "整合包预览已就绪".into();
                 self.failed = false;
+                let draft = self.draft.as_ref().unwrap();
                 if crate::preferences::current().quick == 1
-                    && self.draft.as_ref().is_some_and(|d| {
-                        d.pack.upstream.is_some()
-                            && d.pack.target.is_none()
-                            && d.pack.metadata_error.is_none()
-                            && d.pack.optional_count == 0
-                            && !(0..d.pack.files.len()).any(|i| d.missing(i))
-                    })
+                    && (dropped || draft.pack.upstream.is_some())
+                    && draft.pack.target.is_none()
+                    && draft.pack.metadata_error.is_none()
+                    && draft.pack.optional_error.is_none()
+                    && draft.pack.optional_count == 0
+                    && !(0..draft.pack.files.len()).any(|i| draft.missing(i))
                 {
                     self.confirm_pack(false, cx);
+                } else if dropped
+                    && draft.pack.metadata_error.is_none()
+                    && draft
+                        .pack
+                        .files
+                        .iter()
+                        .any(|f| !f.optional() && f.automatic.is_some())
+                {
+                    let pack = draft.pack.clone();
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    self.cancel = Some(cancel.clone());
+                    self.status = "正在预下载整合包必需文件".into();
+                    let (tx, rx) = async_channel::unbounded();
+                    std::thread::spawn(move || {
+                        let result = pack.prefetch(&cancel, &|s| {
+                            let _ = tx.try_send(Update::Status(s));
+                        });
+                        let _ = tx.try_send(Update::PackPrefetched(result));
+                    });
+                    self.listen(rx, cx);
                 }
             }
             Err(e) => self.message(Err(e), cx),

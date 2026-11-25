@@ -4,6 +4,7 @@ use crate::market::{self, Hit, Release, Source};
 
 pub(super) enum Pack {
     Local(PathBuf),
+    Dropped(PathBuf),
     UpdateLocal(PathBuf, Instance),
     UpdateOnline(Release, Instance),
     Retry(PathBuf, Option<crate::content::Upstream>, Option<Instance>),
@@ -89,6 +90,7 @@ impl Home {
             let report = |s| {
                 let _ = tx.try_send(Update::Status(s));
             };
+            let dropped = matches!(&pack, Pack::Dropped(_));
             let result = (|| -> Result<_> {
                 let mut retry_origin = None;
                 let (file, target) = match pack {
@@ -96,7 +98,7 @@ impl Home {
                         retry_origin = origin;
                         (Ok(path), target)
                     }
-                    Pack::Local(path) => (Ok(path), None),
+                    Pack::Local(path) | Pack::Dropped(path) => (Ok(path), None),
                     Pack::UpdateLocal(path, item) => (Ok(path), Some(item)),
                     Pack::Online(file) => (Err(file), None),
                     Pack::UpdateOnline(file, item) => (Err(file), Some(item)),
@@ -114,7 +116,7 @@ impl Home {
                 anyhow::ensure!(!cancel.load(Ordering::Relaxed), "已取消预览");
                 Ok((path, Box::new(preview)))
             })();
-            let _ = tx.try_send(Update::PackPreview(result));
+            let _ = tx.try_send(Update::PackPreview(result, dropped));
         });
         self.listen(rx, cx);
     }

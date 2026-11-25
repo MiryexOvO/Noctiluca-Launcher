@@ -215,7 +215,7 @@ impl Home {
         }
         card
     }
-    pub(super) fn instance_actions(&self, busy: bool, cx: &Context<Self>) -> Div {
+    pub(super) fn remove_instance_action(&self, busy: bool, cx: &Context<Self>) -> Div {
         let linked = self.instances[self.selected].external.is_some();
         let id = self.instances[self.selected].id.clone();
         if self.controls.confirm.as_ref() == Some(&id) {
@@ -249,12 +249,9 @@ impl Home {
         }
         div()
             .flex()
-            .gap_2()
-            .child(
-                Button::new("settings", "启动设置")
-                    .disabled(busy)
-                    .on_click(cx.listener(|h, _, _, cx| h.open_settings(cx))),
-            )
+            .border_t_1()
+            .border_color(rgb(LINE))
+            .pt_1()
             .child(
                 Button::new(
                     "delete-instance",
@@ -264,6 +261,12 @@ impl Home {
                         "删除实例"
                     },
                 )
+                .icon(if linked {
+                    IconName::Link
+                } else {
+                    IconName::Trash2
+                })
+                .variant(ButtonVariant::Ghost)
                 .disabled(busy)
                 .on_click(cx.listener(move |h, _, _, cx| {
                     h.controls.confirm = Some(id.clone());

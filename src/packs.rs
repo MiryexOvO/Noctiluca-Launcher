@@ -461,6 +461,59 @@ impl Preview {
         Ok(())
     }
 
+    fn downloads<'a>(
+        &self,
+        cancel: &'a AtomicBool,
+        report: &'a (dyn Fn(String) + Sync),
+    ) -> Result<Downloads<'a>> {
+        let curse = self.curse;
+        let mut downloads = Downloads::new(cancel, report)?;
+        downloads.http = crate::download::client_builder()
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if download_host(attempt.url(), curse) && attempt.previous().len() < 8 {
+                    attempt.follow()
+                } else {
+                    attempt.error("整合包下载跳转到不受支持的地址")
+                }
+            }))
+            .build()?;
+        Ok(downloads)
+    }
+
+    fn cache_files(&self, downloads: &Downloads, selected: &[(usize, &PackFile)]) -> Result<()> {
+        let mut tasks = Vec::new();
+        for &(i, file) in selected {
+            let destination = self.cache_path(i);
+            if let Some(url) = &file.automatic {
+                tasks.push(DownloadTask {
+                    url: url.to_string(),
+                    destination,
+                    checksum: Some(Checksum::Sha1(file.hashes["sha1"].clone())),
+                    label: file.path.clone(),
+                });
+            } else {
+                ensure!(destination.is_file(), "请补齐文件：{}", file.path);
+            }
+        }
+        downloads.batch(self.cache.path(), "整合包文件", tasks)
+    }
+
+    pub fn prefetch(&self, cancel: &AtomicBool, report: &(dyn Fn(String) + Sync)) -> Result<()> {
+        let downloads = self.downloads(cancel, report)?;
+        let required: Vec<_> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.optional() && f.automatic.is_some())
+            .collect();
+        self.cache_files(&downloads, &required)?;
+        for (i, file) in required {
+            self.check_sha512(file, &self.cache_path(i), cancel)
+                .with_context(|| crate::download::FileFailure::new("整合包校验", &file.path))?;
+        }
+        Ok(())
+    }
+
     pub fn install(
         &self,
         root: &Path,
@@ -483,38 +536,14 @@ impl Preview {
             bail!("{error}");
         }
         let instance = &self.instance;
-        let curse = self.curse;
-        let mut downloads = Downloads::new(cancel, &report)?;
-        downloads.http = crate::download::client_builder()
-            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                if download_host(attempt.url(), curse) && attempt.previous().len() < 8 {
-                    attempt.follow()
-                } else {
-                    attempt.error("整合包下载跳转到不受支持的地址")
-                }
-            }))
-            .build()?;
+        let downloads = self.downloads(cancel, &report)?;
         let selected: Vec<_> = self
             .files
             .iter()
             .enumerate()
             .filter(|(i, f)| !f.optional() || optional.contains(i))
             .collect();
-        let mut tasks = Vec::new();
-        for &(i, file) in &selected {
-            let destination = self.cache_path(i);
-            if let Some(url) = &file.automatic {
-                tasks.push(DownloadTask {
-                    url: url.to_string(),
-                    destination,
-                    checksum: Some(Checksum::Sha1(file.hashes["sha1"].clone())),
-                    label: file.path.clone(),
-                });
-            } else {
-                ensure!(destination.is_file(), "请补齐文件：{}", file.path);
-            }
-        }
-        downloads.batch(self.cache.path(), "整合包文件", tasks)?;
+        self.cache_files(&downloads, &selected)?;
         let temp = tempfile::tempdir_in(root)?;
         let game = temp.path().join("game");
         fs::create_dir_all(&game)?;

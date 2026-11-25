@@ -1,6 +1,7 @@
 mod content;
 mod hub;
 mod instance_controls;
+mod instance_panel;
 mod manager;
 mod motion;
 mod pack_import;
@@ -103,7 +104,8 @@ enum Update {
     Exited(String, Result<()>),
     Imported(Box<Instance>),
     Changed(Box<Instance>),
-    PackPreview(Result<(PathBuf, Box<crate::packs::Preview>)>),
+    PackPreview(Result<(PathBuf, Box<crate::packs::Preview>)>, bool),
+    PackPrefetched(Result<()>),
     PackFinished(Result<()>, Option<String>),
     Status(String),
     Finished(Result<()>, &'static str),
@@ -364,7 +366,19 @@ impl Home {
                                 }
                                 home.outcomes.insert(id, (failed, msg));
                             }
-                            Update::PackPreview(result) => home.preview_ready(result, cx),
+                            Update::PackPreview(result, dropped) => {
+                                home.preview_ready(result, dropped, cx)
+                            }
+                            Update::PackPrefetched(result) => {
+                                home.cancel = None;
+                                match result {
+                                    Ok(()) => {
+                                        home.failed = false;
+                                        home.status = "可自动下载的必需文件已就绪".into();
+                                    }
+                                    Err(e) => home.pack_finished(Err(e), None, cx),
+                                }
+                            }
                             Update::PackFinished(result, launch) => {
                                 home.pack_finished(result, launch, cx)
                             }
@@ -625,23 +639,6 @@ impl Home {
                     ),
             )
             .child(
-                Button::new(
-                    "sidebar-import",
-                    if self.draft.is_some() {
-                        "继续导入整合包"
-                    } else {
-                        "导入整合包"
-                    },
-                )
-                .icon(IconName::Package)
-                .full_width()
-                .when(self.page == Page::Import, |b| {
-                    b.variant(ButtonVariant::Subtle)
-                })
-                .disabled(busy)
-                .on_click(cx.listener(|home, _, _, cx| home.import_pack(cx))),
-            )
-            .child(
                 div()
                     .id("library-list")
                     .flex_1()
@@ -694,7 +691,7 @@ impl Home {
             )
     }
 
-    fn detail(&self, frame: motion::Frame, cx: &Context<Self>) -> impl IntoElement {
+    fn detail(&self, frame: motion::Frame, wide: bool, cx: &Context<Self>) -> impl IntoElement {
         let item = &self.instances[self.selected];
         let running = self.running.contains_key(&item.id);
         let busy = self.cancel.is_some() || running;
@@ -733,26 +730,6 @@ impl Home {
                 },
             )));
         }
-        let mut files = div().flex().flex_wrap().gap_2();
-        for (id, label, path) in [
-            ("worlds", "存档", "game/saves"),
-            ("mods", "模组", "game/mods"),
-            ("packs", "资源包", "game/resourcepacks"),
-            ("shaders", "光影", "game/shaderpacks"),
-            ("screenshots", "截图", "game/screenshots"),
-            ("schematics", "投影", "game/schematics"),
-        ] {
-            files = files.child(Button::new(id, label).on_click(cx.listener(
-                move |home, _, _, cx| {
-                    home.browse_files(label, path.strip_prefix("game/").unwrap_or(path), cx)
-                },
-            )));
-        }
-        files = files.child(Button::new("console", "实时控制台").on_click(cx.listener(
-            |home, _, _, cx| {
-                home.start_console("last-launch.log", cx);
-            },
-        )));
         div()
             .flex()
             .flex_col()
@@ -785,46 +762,7 @@ impl Home {
             )
             .child(frame.section(actions, 1))
             .child(frame.section(self.memory_panel(busy, cx), 2))
-            .child(
-                frame.section(
-                    panel("实例文件")
-                        .child(files)
-                        .child(self.instance_actions(busy, cx))
-                        .child(
-                            Button::new("content-tools", "组件与整合包")
-                                .disabled(busy)
-                                .on_click(cx.listener(|h, _, _, cx| h.open_content(cx))),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .gap_2()
-                                .child(
-                                    Button::new("open-backups", "备份与克隆")
-                                        .disabled(busy)
-                                        .on_click(cx.listener(|home, _, _, cx| {
-                                            home.page = Page::Backups;
-                                            home.read_backups(cx);
-                                        })),
-                                )
-                                .when(item.loader != Loader::Vanilla, |el| {
-                                    el.child(
-                                        Button::new("manage-mods", "管理模组")
-                                            .disabled(busy)
-                                            .on_click(cx.listener(|home, _, _, cx| {
-                                                home.page = Page::Mods;
-                                                home.hits.clear();
-                                                home.content.curse =
-                                                    crate::preferences::current().community == 1;
-                                                home.refresh_mods(cx);
-                                            })),
-                                    )
-                                }),
-                        ),
-                    3,
-                ),
-            )
+            .child(frame.section(self.instance_panel(wide, busy, cx), 3))
     }
 
     fn start_console(&mut self, log: &'static str, cx: &mut Context<Self>) {
@@ -1389,8 +1327,15 @@ impl Home {
                     .justify_between()
                     .child(heading("新建实例"))
                     .child(
-                        Button::new("import-pack", "导入整合包")
-                            .on_click(cx.listener(|home, _, _, cx| home.import_pack(cx))),
+                        Button::new(
+                            "import-pack",
+                            if self.draft.is_some() {
+                                "继续导入整合包"
+                            } else {
+                                "导入整合包"
+                            },
+                        )
+                        .on_click(cx.listener(|home, _, _, cx| home.import_pack(cx))),
                     ),
             )
             .child(kicker("实例名称"))
@@ -1490,7 +1435,9 @@ impl Render for Home {
             Page::Files => self.files_page(cx).into_any_element(),
             Page::Library => self.manager_page(cx).into_any_element(),
             Page::Hub => self.hub_page(cx).into_any_element(),
-            Page::Detail => self.detail(frame, cx).into_any_element(),
+            Page::Detail => self
+                .detail(frame, window.viewport_size().width >= px(920.), cx)
+                .into_any_element(),
             Page::Create => self.form(cx).into_any_element(),
             Page::Accounts => self.account_page(cx).into_any_element(),
             Page::Mods => self.mods_page(cx).into_any_element(),
