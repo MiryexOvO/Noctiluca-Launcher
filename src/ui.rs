@@ -8,6 +8,7 @@ mod motion;
 mod pack_import;
 mod players;
 mod preferences;
+mod project_icon;
 mod settings;
 mod titlebar;
 use std::{

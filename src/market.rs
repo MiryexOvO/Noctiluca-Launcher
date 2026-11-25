@@ -1,3 +1,4 @@
+pub mod icon;
 use crate::{
     download::{self, Downloads},
     library::{Loader, safe_id},
@@ -72,6 +73,9 @@ pub struct Hit {
     pub id: String,
     pub title: String,
     pub description: String,
+    pub icon_url: Option<String>,
+    pub reference_version: Option<String>,
+    pub reference_size: Option<u64>,
 }
 #[derive(Clone)]
 pub struct Release {
@@ -82,6 +86,7 @@ pub struct Release {
     pub url: String,
     pub sha1: String,
     pub filename: String,
+    pub size: Option<u64>,
 }
 impl Release {
     pub fn archive(&self, root: &Path, downloads: &Downloads) -> Result<PathBuf> {
@@ -125,6 +130,8 @@ struct Project {
     project_id: String,
     title: String,
     description: String,
+    icon_url: Option<String>,
+    latest_version: Option<String>,
 }
 #[derive(Deserialize)]
 struct Version {
@@ -139,6 +146,7 @@ struct PackAsset {
     url: String,
     hashes: Hashes,
     primary: bool,
+    size: Option<u64>,
 }
 #[derive(Deserialize)]
 struct Hashes {
@@ -182,9 +190,43 @@ pub fn search(
             id: p.project_id,
             title: p.title,
             description: p.description,
+            icon_url: p.icon_url,
+            reference_version: p.latest_version,
+            reference_size: None,
         })
         .collect())
 }
+fn primary_file(files: Vec<PackAsset>, kind: Kind) -> Option<PackAsset> {
+    files
+        .into_iter()
+        .filter(|f| {
+            f.filename
+                .to_ascii_lowercase()
+                .ends_with(kind.extension(Source::Modrinth))
+        })
+        .max_by_key(|f| f.primary)
+}
+
+pub fn reference_sizes(
+    kind: Kind,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, u64>> {
+    if ids.is_empty() {
+        return Ok(Default::default());
+    }
+    let versions: Vec<Version> = download::client()?
+        .get("https://api.modrinth.com/v2/versions")
+        .timeout(std::time::Duration::from_secs(10))
+        .query(&[("ids", serde_json::to_string(ids)?)])
+        .send()?
+        .error_for_status()?
+        .json()?;
+    Ok(versions
+        .into_iter()
+        .filter_map(|v| Some((v.id, primary_file(v.files, kind)?.size?)))
+        .collect())
+}
+
 pub fn releases(source: Source, loader: Loader, mc: &str, project: &str) -> Result<Vec<Release>> {
     files(source, Kind::Pack, Some(loader), mc, project)
 }
@@ -214,15 +256,7 @@ pub fn files(
     Ok(versions
         .into_iter()
         .filter_map(|v| {
-            let file = v
-                .files
-                .into_iter()
-                .filter(|f| {
-                    f.filename
-                        .to_ascii_lowercase()
-                        .ends_with(kind.extension(source))
-                })
-                .max_by_key(|f| f.primary)?;
+            let file = primary_file(v.files, kind)?;
             Some(Release {
                 source,
                 project: project.into(),
@@ -231,6 +265,7 @@ pub fn files(
                 url: file.url,
                 sha1: file.hashes.sha1,
                 filename: file.filename,
+                size: file.size,
             })
         })
         .collect())

@@ -71,6 +71,22 @@ struct Project {
     name: String,
     summary: String,
     class_id: Option<u32>,
+    logo: Option<Logo>,
+    #[serde(default)]
+    latest_files: Vec<PreviewFile>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Logo {
+    thumbnail_url: Option<String>,
+    url: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewFile {
+    file_name: String,
+    file_date: Option<String>,
+    file_length: Option<u64>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +95,7 @@ struct File {
     mod_id: u64,
     display_name: String,
     file_name: String,
+    file_length: Option<u64>,
     download_url: Option<String>,
     hashes: Vec<Hash>,
     #[serde(default)]
@@ -143,14 +160,32 @@ pub fn search_class(
         request = request.query(&[("gameVersion", mc)]);
     }
     let projects: Vec<Project> = get(request)?;
-    Ok(projects
-        .into_iter()
-        .map(|p| Hit {
-            id: p.id.to_string(),
-            title: p.name,
-            description: p.summary,
-        })
-        .collect())
+    Ok(projects.into_iter().map(|p| p.into_hit(class)).collect())
+}
+impl Project {
+    fn into_hit(self, class: &str) -> Hit {
+        Hit {
+            id: self.id.to_string(),
+            title: self.name,
+            description: self.summary,
+            icon_url: self
+                .logo
+                .and_then(|l| l.thumbnail_url.filter(|u| !u.trim().is_empty()).or(l.url)),
+            reference_version: None,
+            reference_size: self
+                .latest_files
+                .into_iter()
+                .filter(|f| {
+                    f.file_name.to_ascii_lowercase().ends_with(if class == "6" {
+                        ".jar"
+                    } else {
+                        ".zip"
+                    })
+                })
+                .max_by(|a, b| a.file_date.cmp(&b.file_date))
+                .and_then(|f| f.file_length),
+        }
+    }
 }
 pub fn releases(kind: Kind, loader: Option<Loader>, mc: &str, id: &str) -> Result<Vec<Release>> {
     let (http, api) = api()?;
@@ -184,6 +219,7 @@ pub fn releases(kind: Kind, loader: Option<Loader>, mc: &str, id: &str) -> Resul
                     url: f.url()?,
                     sha1: f.sha1()?,
                     filename: f.file_name,
+                    size: f.file_length,
                 });
             }
         }

@@ -103,6 +103,34 @@ impl Hub {
         self.offset = 0;
     }
 }
+fn file_size(size: Option<u64>, label: &str) -> String {
+    let Some(bytes) = size else {
+        return format!("{label}大小待确认");
+    };
+    if bytes < 1024 {
+        return format!("{label} · {bytes} B");
+    }
+    let (scale, unit) = if bytes >= 1 << 30 {
+        (1_u64 << 30, "GiB")
+    } else if bytes >= 1 << 20 {
+        (1 << 20, "MiB")
+    } else {
+        (1024, "KiB")
+    };
+    format!("{label} · {:.1} {unit}", bytes as f64 / scale as f64)
+}
+
+fn reference_size(hit: &Hit, kind: Kind) -> Div {
+    kicker(&file_size(
+        hit.reference_size,
+        if kind == Kind::Pack {
+            "参考压缩包"
+        } else {
+            "参考文件"
+        },
+    ))
+}
+
 impl Home {
     pub(super) fn install_pack(&mut self, pack: Pack, cx: &mut Context<Self>) {
         if self.cancel.is_some() || self.copying || self.logging_in {
@@ -174,15 +202,52 @@ impl Home {
             .spawn(async move { market::search(source, kind, loader, &mc, &q, offset) });
         cx.spawn(async move |view, cx| {
             let r = task.await;
+            let ids = view
+                .update(cx, |home, cx| {
+                    let h = &mut home.hub;
+                    if h.request != request {
+                        return Vec::new();
+                    }
+                    h.loading = false;
+                    match r {
+                        Ok(v) => h.hits = v,
+                        Err(e) => h.error = Some(format!("{e:#}")),
+                    }
+                    for url in h
+                        .hits
+                        .iter()
+                        .filter_map(|h| h.icon_url.as_deref())
+                        .filter(|u| !u.is_empty())
+                    {
+                        super::project_icon::prepare(&home.root, url, cx);
+                    }
+                    cx.notify();
+                    h.hits
+                        .iter()
+                        .filter_map(|h| h.reference_version.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return;
+            }
+            let Ok(sizes) = cx
+                .background_executor()
+                .spawn(async move { market::reference_sizes(kind, &ids) })
+                .await
+            else {
+                return;
+            };
             let _ = view.update(cx, |home, cx| {
                 let h = &mut home.hub;
-                if h.request != request {
+                if h.source != source || h.kind != kind {
                     return;
                 }
-                h.loading = false;
-                match r {
-                    Ok(v) => h.hits = v,
-                    Err(e) => h.error = Some(format!("{e:#}")),
+                for hit in h.hits.iter_mut().chain(h.project.iter_mut()) {
+                    if let Some(size) = hit.reference_version.as_ref().and_then(|id| sizes.get(id))
+                    {
+                        hit.reference_size = Some(*size);
+                    }
                 }
                 cx.notify();
             });
@@ -287,7 +352,15 @@ impl Home {
                     .flex()
                     .justify_between()
                     .items_center()
-                    .child(heading(&hit.title))
+                    .gap_3()
+                    .child(super::project_icon::tile(&self.root, hit, h.kind, 64.))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .child(heading(&hit.title))
+                            .child(reference_size(hit, h.kind)),
+                    )
                     .child(
                         Button::new("discover-back", "返回搜索结果").on_click(cx.listener(
                             |home, _, _, cx| {
@@ -404,6 +477,10 @@ impl Home {
                     .items_center()
                     .gap_2()
                     .child(div().flex_1().min_w_0().child(file.name.clone()))
+                    .child(kicker(&file_size(
+                        file.size,
+                        if h.is_pack() { "压缩包" } else { "文件" },
+                    )))
                     .child(
                         Button::new(
                             ("discovery-install", i),
@@ -554,19 +631,44 @@ impl Home {
         for (i, hit) in h.hits.iter().enumerate() {
             let hit = hit.clone();
             body = body.child(
-                panel(&hit.title).child(kicker(&hit.description)).child(
-                    Button::new(
-                        ("discover-project", i),
-                        if h.is_pack() {
-                            "选择整合包版本"
-                        } else {
-                            "下载"
-                        },
+                div()
+                    .p_3()
+                    .bg(rgb(PANEL))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(super::project_icon::tile(&self.root, &hit, h.kind, 48.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(hit.title.clone()),
+                            )
+                            .child(kicker(&hit.description))
+                            .child(reference_size(&hit, h.kind)),
                     )
-                    .on_click(
-                        cx.listener(move |home, _, _, cx| home.open_project(hit.clone(), cx)),
+                    .child(
+                        Button::new(
+                            ("discover-project", i),
+                            if h.is_pack() {
+                                "选择整合包版本"
+                            } else {
+                                "下载"
+                            },
+                        )
+                        .on_click(
+                            cx.listener(move |home, _, _, cx| home.open_project(hit.clone(), cx)),
+                        ),
                     ),
-                ),
             );
         }
         if h.offset > 0 || h.hits.len() == 10 {
