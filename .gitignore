@@ -1,0 +1,42 @@
+/target/
+/.build/
+/MCSTART-data/
+/Noctiluca-data/
+
+# Local development notes and assistant configuration
+/docs/
+.agents/
+.agent/
+.codex/
+.claude/
+.cursor/
+.aider*
+.github/copilot-instructions.md
+.github/instructions/
+AGENT.md
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+AI_INSTRUCTIONS.md
+.cursorrules
+
+# Local verification, fixtures and test output
+/qa/
+tests/
+test/
+fixtures/
+test-results/
+coverage/
+*_tests.rs
+*_test.rs
+test_*.rs
+tests.rs
+test.rs
+
+# Portable builds, credentials and machine-local settings
+/*.exe
+*.pdb
+.env
+.env.*
+.vs/
+.idea/
