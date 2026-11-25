@@ -139,9 +139,6 @@ pub struct Home {
     focus: FocusHandle,
     root: PathBuf,
     accounts: Accounts,
-    auth_id: Option<String>,
-    auth_input: Entity<TextInput>,
-    auth_edit: bool,
     launch_after_login: Option<String>,
     login_cancel: Option<Arc<AtomicBool>>,
     logging_in: bool,
@@ -217,14 +214,6 @@ impl Home {
                     motion::sync_preference(cx);
                 }
             }),
-            auth_id: None,
-            auth_input: cx.new(|cx| {
-                TextInput::new(window, cx)
-                    .label("应用程序（客户端）ID")
-                    .placeholder("Microsoft Entra 应用的公开客户端 ID")
-                    .max_len(64)
-            }),
-            auth_edit: false,
             launch_after_login: None,
             login_cancel: None,
             manager: manager::Manager::new(&root, window, cx),
@@ -1222,6 +1211,14 @@ fn panel(title: &str) -> Div {
         .child(kicker(title))
 }
 
+impl Drop for Home {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.login_cancel {
+            cancel.store(true, Ordering::Release);
+        }
+    }
+}
+
 impl Render for Home {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.page != Page::Accounts {
@@ -1336,5 +1333,6 @@ impl Render for Home {
                             ),
                     ),
             )
+            .when_some(self.device_dialog(cx), |root, dialog| root.child(dialog))
     }
 }

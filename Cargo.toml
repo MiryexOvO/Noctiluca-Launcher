@@ -15,7 +15,7 @@ async-channel = "2"
 chrono = "0.4"
 rayon = "1"
 regex = "1"
-reqwest = { version = "0.13", features = ["blocking", "json", "query", "system-proxy"] }
+reqwest = { version = "0.13", features = ["blocking", "form", "json", "query", "system-proxy"] }
 rust-embed = { version = "8", features = ["debug-embed"] }
 keyring = { version = "3.6", features = ["windows-native"] }
 open = "5"

@@ -1,19 +1,14 @@
+pub mod device;
+
 use std::{
     fs,
-    io::{BufRead, BufReader, Read, Write},
-    net::TcpListener,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
-use mc_launcher_core::{
-    account::Account, auth::microsoft_account as msa,
-    types::microsoft_types::AuthorizationTokenResponse,
-};
+use anyhow::{Context, Result, anyhow, ensure};
+use mc_launcher_core::{account::Account, auth::microsoft_account as msa};
 use serde::{Deserialize, Serialize};
-use url::Url;
 use uuid::Uuid;
 
 use crate::library::atomic_write;
@@ -161,82 +156,26 @@ pub fn forget(root: &Path, player: &Player) -> Result<Accounts> {
     })
 }
 
-fn callback(listener: TcpListener, state: &str, cancel: &AtomicBool) -> Result<String> {
-    listener.set_nonblocking(true)?;
-    let deadline = Instant::now() + Duration::from_secs(180);
-    while Instant::now() < deadline {
-        ensure!(!cancel.load(Ordering::Relaxed), "登录已取消");
-        let (mut socket, _) = match listener.accept() {
-            Ok(client) => client,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-            Err(err) => return Err(err.into()),
-        };
-        socket.set_read_timeout(Some(Duration::from_secs(2)))?;
-        let mut line = String::new();
-        if BufReader::new((&socket).take(8192))
-            .read_line(&mut line)
-            .is_err()
-        {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        if parts.next() != Some("GET") {
-            continue;
-        }
-        let Some(path) = parts.next().filter(|p| p.starts_with("/callback?")) else {
-            continue;
-        };
-        let Ok(url) = Url::parse(&format!("http://localhost{path}")) else {
-            continue;
-        };
-        let params = url
-            .query_pairs()
-            .collect::<std::collections::HashMap<_, _>>();
-        if !params.get("state").is_some_and(|s| s.as_ref() == state) {
-            continue;
-        }
-        let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\nYou may close this tab and return to Noctiluca.");
-        if params.contains_key("error") {
-            bail!("微软登录已取消或未获授权")
-        }
-        return params
-            .get("code")
-            .map(|s| s.to_string())
-            .context("微软未返回授权码");
-    }
-    bail!("登录超时，请重试")
-}
-
 fn normalize_client(value: &str) -> Result<String> {
-    let id = Uuid::parse_str(value.trim()).context("请填写有效的应用程序（客户端）ID")?;
-    ensure!(!id.is_nil(), "应用程序 ID 不能为空 UUID");
+    let id = Uuid::parse_str(value.trim()).context("此版本的微软登录服务配置无效")?;
+    ensure!(!id.is_nil(), "此版本的微软登录服务配置无效");
     Ok(id.to_string())
 }
 
 pub fn client_id(root: &Path) -> Result<Option<String>> {
+    if let Some(id) = option_env!("NOCTILUCA_CLIENT_ID") {
+        return normalize_client(id).map(Some);
+    }
+    if let Some(id) = crate::setting("CLIENT_ID") {
+        return normalize_client(id.to_str().context("微软登录服务配置无效")?).map(Some);
+    }
     match fs::read(root.join("microsoft-client.json")) {
-        Ok(data) => Ok(Some(normalize_client(&serde_json::from_slice::<String>(
-            &data,
-        )?)?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let value = crate::setting("CLIENT_ID")
-                .and_then(|s| s.into_string().ok())
-                .or_else(|| option_env!("NOCTILUCA_CLIENT_ID").map(str::to_owned));
-            value.as_deref().map(normalize_client).transpose()
-        }
+        Ok(data) => Ok(Some(normalize_client(
+            &serde_json::from_slice::<String>(&data).context("微软登录服务配置无效")?,
+        )?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
-}
-pub fn save_client(root: &Path, value: &str) -> Result<String> {
-    let id = normalize_client(value)?;
-    atomic_write(
-        &root.join("microsoft-client.json"),
-        &serde_json::to_vec(&id)?,
-    )?;
-    Ok(id)
 }
 struct Session {
     skin: Option<String>,
@@ -260,11 +199,9 @@ impl Licenses {
             .any(|i| matches!(i.name.as_str(), "product_minecraft" | "game_minecraft"))
     }
 }
-fn minecraft_session(tokens: AuthorizationTokenResponse) -> Result<Session> {
+fn minecraft_session(tokens: device::Tokens) -> Result<Session> {
     ensure!(
-        tokens.error.is_none()
-            && !tokens.access_token.is_empty()
-            && !tokens.refresh_token.is_empty(),
+        !tokens.access_token.is_empty() && !tokens.refresh_token.is_empty(),
         "Microsoft 未签发有效的会话，请重新登录"
     );
     let xbl = msa::authenticate_with_xbl(&tokens.access_token)
@@ -313,29 +250,24 @@ fn minecraft_session(tokens: AuthorizationTokenResponse) -> Result<Session> {
     })
 }
 
-fn authorization_url(client: &str, redirect: &str, hint: &str) -> Result<(Url, String, String)> {
-    let (url, state, verifier) = msa::get_secure_login_data(client, redirect, None);
-    let mut url = Url::parse(&url)?;
-    if hint.trim().is_empty() {
-        url.query_pairs_mut()
-            .append_pair("prompt", "select_account");
-    } else {
-        url.query_pairs_mut().append_pair("login_hint", hint.trim());
-    }
-    Ok((url, state, verifier))
+pub struct MicrosoftLogin {
+    player: Player,
+    refresh_token: String,
 }
 
-pub fn login(root: &Path, client: String, hint: &str, cancel: &AtomicBool) -> Result<Accounts> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    let redirect = format!(
-        "http://localhost:{}/callback",
-        listener.local_addr()?.port()
-    );
-    let (url, state, verifier) = authorization_url(&client, &redirect, hint)?;
-    open::that(url.as_str()).context("无法打开系统浏览器")?;
-    let code = callback(listener, &state, cancel)?;
-    let tokens = msa::get_authorization_token(&client, None, &redirect, &code, Some(&verifier))
-        .context("微软授权码兑换失败，请检查应用 ID 和桌面回调地址")?;
+impl MicrosoftLogin {
+    pub fn save(self, root: &Path) -> Result<Accounts> {
+        add(root, self.player, Some(&self.refresh_token))
+    }
+}
+
+pub fn login(
+    client: String,
+    cancel: &AtomicBool,
+    show: impl FnOnce(device::Prompt) -> Result<()>,
+) -> Result<MicrosoftLogin> {
+    let tokens = device::authorize(&client, cancel, show)?;
+    ensure!(!cancel.load(Ordering::Acquire), "登录已取消");
     let session = minecraft_session(tokens)?;
     ensure!(!cancel.load(Ordering::Relaxed), "登录已取消");
     let player = Player {
@@ -345,7 +277,10 @@ pub fn login(root: &Path, client: String, hint: &str, cancel: &AtomicBool) -> Re
         name: session.name,
         client,
     };
-    add(root, player, Some(&session.refresh_token))
+    Ok(MicrosoftLogin {
+        player,
+        refresh_token: session.refresh_token,
+    })
 }
 pub fn add(root: &Path, player: Player, token: Option<&str>) -> Result<Accounts> {
     change(root, |data| {
@@ -372,7 +307,7 @@ pub fn identity(player: Option<&Player>) -> Result<Account> {
     }
     let entry = credential(player)?;
     let refresh = entry.get_password().context("未找到登录凭据，请重新登录")?;
-    let tokens = msa::refresh_authorization_token(&player.client, None, &refresh)
+    let tokens = device::refresh(&player.client, &refresh)
         .context("微软会话刷新失败，请检查网络或重新登录")?;
     let session = minecraft_session(tokens)?;
     ensure!(session.id == player.id, "登录账号不匹配，请重新登录");

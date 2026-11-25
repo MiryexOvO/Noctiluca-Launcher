@@ -43,8 +43,10 @@ Noctiluca-data/
 侧栏显示当前角色的头像、游戏名和登录类型。可添加多个账号，切换角色并管理头像和角色名。
 
 - **离线** 输入角色名即可添加。首次安装游戏需要下载资源。服务器是否接受该身份取决于服务器的认证设置。选取本地皮肤 PNG 可以设置启动器里的头像。
-- **Microsoft** 在「添加账号 → Microsoft」可先填微软账号，点击「微软正版登录」，在微软官方页面输入密码或使用通行密钥。开发者可在「游戏账号 → 登录服务设置」中配置本应用的公开客户端 ID。应用须支持个人微软账号、桌面回调 `http://localhost/callback` 并获准访问 Minecraft 服务。启动器校验游戏授权和 Java 角色，刷新令牌保存在 Windows 凭据管理器。[微软桌面回调配置](https://learn.microsoft.com/en-us/entra/identity-platform/reply-url)
+- **Microsoft** 点击「微软正版登录」。Noctiluca 会显示并复制一次性代码，自动打开微软验证页。也可以在手机上打开弹窗里的网址完成授权。成功后自动显示 Java 角色，刷新令牌存放在 Windows 凭据管理器。
 - **第三方** 填写认证站提供的 Yggdrasil HTTPS API 根地址和该站账号。多角色账号可指定角色名。游戏使用与该站配套的 authlib-injector 登录。[authlib-injector 项目](https://github.com/yushijinhun/authlib-injector)
+
+发布者可在构建时通过 `NOCTILUCA_CLIENT_ID` 提供 Noctiluca 的公开客户端 ID。应用需支持个人微软账号、启用公共客户端设备代码流，并具备 Minecraft 服务访问权限。玩家可直接使用已配置的发布版。旧版保存的服务配置继续生效。[微软设备代码协议](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code)
 
 ## 从源码构建
 

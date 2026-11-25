@@ -1,5 +1,6 @@
 use super::*;
 use crate::accounts::{Kind, Player};
+use ely_gpui_component::overlays::Dialog;
 use ely_gpui_component::{buttons::IconButton, theme::ControlSize};
 pub(super) struct Profiles {
     add: bool,
@@ -7,7 +8,8 @@ pub(super) struct Profiles {
     name: Entity<TextInput>,
     server: Entity<TextInput>,
     username: Entity<TextInput>,
-    microsoft_account: Entity<TextInput>,
+    client: Option<String>,
+    device: Option<accounts::device::Prompt>,
     password: Entity<TextInput>,
     avatar: Option<PathBuf>,
     ticket: u64,
@@ -43,7 +45,8 @@ impl Profiles {
             kind: Kind::Microsoft,
             name: field("角色名", "游戏中的角色名"),
             server: field("认证服务器", "https://example.org/api/yggdrasil/"),
-            microsoft_account: field("微软账号", "邮箱、手机号或 Skype（可选）"),
+            client: None,
+            device: None,
             username: field("认证站账号", "认证站用户名或邮箱"),
             password: cx.new(|cx| {
                 TextInput::new(window, cx)
@@ -224,17 +227,13 @@ impl Home {
         self.status = "就绪".into();
         self.profiles.rename = false;
         self.profiles.add = self.accounts.players.is_empty();
-        self.auth_id = match accounts::client_id(&self.root) {
-            Ok(v) => v,
+        self.profiles.client = match accounts::client_id(&self.root) {
+            Ok(client) => client,
             Err(e) => {
                 self.message(Err(e), cx);
                 None
             }
         };
-        self.auth_edit = false;
-        self.auth_input.update(cx, |f, cx| {
-            f.set_text(self.auth_id.clone().unwrap_or_default(), cx)
-        });
         cx.notify();
     }
     fn account_result(&mut self, result: Result<Accounts>, cx: &mut Context<Self>) {
@@ -265,6 +264,113 @@ impl Home {
             self.play(false, cx);
         }
     }
+    fn cancel_microsoft(&mut self, cx: &mut Context<Self>) {
+        if let Some(attempt) = self.login_cancel.take() {
+            attempt.store(true, Ordering::Release);
+            self.profiles.device = None;
+            self.logging_in = false;
+            self.status = "已取消微软登录".into();
+            self.failed = false;
+            cx.notify();
+        }
+    }
+
+    fn open_verification(&mut self, cx: &mut Context<Self>) {
+        if let Some(prompt) = &self.profiles.device
+            && open::that_detached(&prompt.verification_uri).is_err()
+        {
+            self.status = "请在浏览器中打开弹窗内的微软验证地址".into();
+        }
+        cx.notify();
+    }
+
+    fn start_microsoft_login(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.profiles.client.clone() else {
+            return;
+        };
+        let attempt = Arc::new(AtomicBool::new(false));
+        self.login_cancel = Some(attempt.clone());
+        self.logging_in = true;
+        self.failed = false;
+        self.status = "正在向微软获取登录代码…".into();
+        let (tx, rx) = async_channel::bounded(1);
+        let stop = attempt.clone();
+        let task = cx.background_executor().spawn(async move {
+            accounts::login(client, &stop, move |prompt| {
+                tx.try_send(prompt)
+                    .map_err(|_| anyhow::anyhow!("登录窗口已关闭"))
+            })
+        });
+        cx.spawn(async move |view, cx| {
+            if let Ok(prompt) = rx.recv().await {
+                let _ = view.update(cx, |home, cx| {
+                    if attempt.load(Ordering::Acquire) {
+                        return;
+                    }
+                    cx.write_to_clipboard(ClipboardItem::new_string(prompt.user_code.clone()));
+                    home.profiles.device = Some(prompt);
+                    home.status = "登录代码已复制，等待微软授权".into();
+                    home.open_verification(cx);
+                });
+            }
+            let result = task.await;
+            let _ = view.update(cx, |home, cx| {
+                if attempt.load(Ordering::Acquire) {
+                    return;
+                }
+                home.logging_in = false;
+                home.login_cancel = None;
+                home.profiles.device = None;
+                let accounts = result.and_then(|login| login.save(&home.root));
+                home.signed_in(accounts, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(super) fn device_dialog(&self, cx: &Context<Self>) -> Option<Dialog> {
+        let prompt = self.profiles.device.as_ref()?;
+        let cancel = cx.weak_entity();
+        let reopen = cx.weak_entity();
+        let copy = cx.weak_entity();
+        Some(
+            Dialog::new(
+                "microsoft-device-dialog",
+                "登录 Minecraft",
+                move |_, cx| {
+                    let _ = cancel.update(cx, |home, cx| home.cancel_microsoft(cx));
+                },
+            )
+            .detail("登录代码已自动复制。请在微软页面输入此代码，然后返回启动器。")
+            .child(heading(&prompt.user_code))
+            .child(kicker("也可以在另一台设备上打开"))
+            .child(div().text_sm().child(prompt.verification_uri.clone()))
+            .action(move |_| {
+                Button::new("reopen-verification", "重新打开网页").on_click(move |_, _, cx| {
+                    let _ = reopen.update(cx, |home, cx| home.open_verification(cx));
+                })
+            })
+            .action(move |_| {
+                Button::new("copy-device-code", "复制代码").on_click(move |_, _, cx| {
+                    let _ = copy.update(cx, |home, cx| {
+                        if let Some(prompt) = &home.profiles.device {
+                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                prompt.user_code.clone(),
+                            ));
+                            home.status = "登录代码已复制".into();
+                            cx.notify();
+                        }
+                    });
+                })
+            })
+            .action(|close| {
+                Button::new("cancel-device-code", "取消")
+                    .on_click(move |_, window, cx| close(window, cx))
+            }),
+        )
+    }
+
     fn authenticate(&mut self, cx: &mut Context<Self>) {
         if self.logging_in {
             return;
@@ -275,35 +381,22 @@ impl Home {
             self.signed_in(r, cx);
             return;
         }
-        let kind = self.profiles.kind;
-        let client = self.auth_id.clone();
-        if kind == Kind::Microsoft && client.is_none() {
-            self.message(Err(anyhow::anyhow!("此版本尚未配置微软登录服务")), cx);
+        if self.profiles.kind == Kind::Microsoft {
+            self.start_microsoft_login(cx);
             return;
         }
         let root = self.root.clone();
-        let hint = self.profiles.microsoft_account.read(cx).text().to_owned();
         let provider = self.profiles.server.read(cx).text().to_owned();
         let user = self.profiles.username.read(cx).text().to_owned();
         let password = self.profiles.password.read(cx).text().to_owned();
         self.profiles
             .password
             .update(cx, |f, cx| f.set_text("", cx));
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.login_cancel = Some(cancel.clone());
         self.logging_in = true;
         self.failed = false;
-        self.status = if kind == Kind::Microsoft {
-            "请在浏览器中完成微软登录"
-        } else {
-            "正在联系认证服务"
-        }
-        .into();
+        self.status = "正在联系认证服务".into();
         let task = cx.background_executor().spawn(async move {
-            match client {
-                Some(id) if kind == Kind::Microsoft => accounts::login(&root, id, &hint, &cancel),
-                _ => crate::third_party::login(&root, &provider, &user, &password, &name),
-            }
+            crate::third_party::login(&root, &provider, &user, &password, &name)
         });
         cx.spawn(async move |view, cx| {
             let result = task.await;
@@ -317,60 +410,12 @@ impl Home {
         cx.notify();
     }
     pub(super) fn account_page(&self, cx: &Context<Self>) -> impl IntoElement {
-        if self.auth_edit {
-            return div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(heading("登录服务设置"))
-                .child(
-                    panel("Microsoft 公共客户端")
-                        .child(Input::new(&self.auth_input))
-                        .child(kicker("桌面应用回调地址  ·  http://localhost/callback"))
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(Button::new("save-client", "保存设置").primary().on_click(
-                                    cx.listener(|h, _, _, cx| {
-                                        match accounts::save_client(
-                                            &h.root,
-                                            h.auth_input.read(cx).text(),
-                                        ) {
-                                            Ok(id) => {
-                                                h.auth_id = Some(id);
-                                                h.auth_edit = false;
-                                                h.status = "登录服务设置已保存".into();
-                                                h.failed = false;
-                                            }
-                                            Err(err) => h.message(Err(err), cx),
-                                        }
-                                        cx.notify();
-                                    }),
-                                ))
-                                .child(Button::new("close-client-settings", "返回账号").on_click(
-                                    cx.listener(|h, _, _, cx| {
-                                        h.auth_edit = false;
-                                        cx.notify();
-                                    }),
-                                )),
-                        ),
-                );
-        }
         let mut page = div().flex().flex_col().gap_3().child(
             div()
                 .flex()
                 .items_center()
                 .justify_between()
                 .child(heading("游戏账号"))
-                .child(
-                    Button::new("account-settings", "登录服务设置")
-                        .disabled(self.logging_in)
-                        .on_click(cx.listener(|h, _, _, cx| {
-                            h.auth_edit = true;
-                            cx.notify();
-                        })),
-                )
                 .child(
                     Button::new("new-profile", "添加账号")
                         .icon(IconName::UserPlus)
@@ -422,13 +467,11 @@ impl Home {
             let mut form = panel("添加账号").child(choices);
             match self.profiles.kind {
                 Kind::Microsoft => {
-                    form = form
-                        .child(kicker("微软账号"))
-                        .child(Input::new(&self.profiles.microsoft_account))
-                        .child(kicker("在微软官方页面输入密码并完成验证。"));
-                    if self.auth_id.is_none() {
-                        form = form.child(kicker("此版本尚未配置微软登录服务。"));
-                    }
+                    form = form.child(kicker(if self.profiles.client.is_some() {
+                        "使用一次性代码在微软官方页面授权，也可以用手机完成。"
+                    } else {
+                        "此版本尚未开通微软登录服务，暂时无法获取登录代码。"
+                    }));
                 }
                 Kind::Offline => {
                     form = form
@@ -457,18 +500,15 @@ impl Home {
                 .primary()
                 .disabled(
                     self.logging_in
-                        || (self.profiles.kind == Kind::Microsoft && self.auth_id.is_none()),
+                        || (self.profiles.kind == Kind::Microsoft
+                            && self.profiles.client.is_none()),
                 )
                 .on_click(cx.listener(|h, _, _, cx| h.authenticate(cx))),
             );
-            if self.logging_in && self.profiles.kind == Kind::Microsoft {
+            if self.login_cancel.is_some() && self.profiles.device.is_none() {
                 form = form.child(
-                    Button::new("cancel-login", "取消登录").on_click(cx.listener(|h, _, _, cx| {
-                        if let Some(c) = &h.login_cancel {
-                            c.store(true, Ordering::Relaxed);
-                        }
-                        cx.notify();
-                    })),
+                    Button::new("cancel-request", "取消登录")
+                        .on_click(cx.listener(|h, _, _, cx| h.cancel_microsoft(cx))),
                 );
             }
             page = page.child(form);
