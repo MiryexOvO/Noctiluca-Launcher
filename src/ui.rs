@@ -19,7 +19,7 @@ pub(crate) use titlebar::title_bar;
 
 use anyhow::{Result, ensure};
 use ely_gpui_component::{
-    buttons::Button,
+    buttons::{Button, ButtonVariant, IconButton},
     forms::{Input, TextInput},
     primitives::{FocusScope, Icon, IconName},
     theme::ActiveTheme,
@@ -523,9 +523,45 @@ impl Home {
             .border_color(rgb(LINE))
             .child(
                 div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(format!("实例库  /  {}", self.instances.len())),
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child(format!("实例库  /  {}", self.instances.len())),
+                    )
+                    .child(
+                        IconButton::new("new", IconName::Plus)
+                            .tooltip("新建实例")
+                            .disabled(busy)
+                            .on_click(cx.listener(|home, _, _, cx| {
+                                home.page = Page::Create;
+                                home.status = "选择游戏版本与加载器".into();
+                                home.failed = false;
+                                home.fetch_versions(false, cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                Button::new(
+                    "sidebar-import",
+                    if self.draft.is_some() {
+                        "继续导入整合包"
+                    } else {
+                        "导入整合包"
+                    },
+                )
+                .icon(IconName::Package)
+                .full_width()
+                .when(self.page == Page::Import, |b| {
+                    b.variant(ButtonVariant::Subtle)
+                })
+                .disabled(busy)
+                .on_click(cx.listener(|home, _, _, cx| home.import_pack(cx))),
             )
             .child(
                 div()
@@ -561,31 +597,12 @@ impl Home {
                     })),
             )
             .child(
-                Button::new(
-                    "sidebar-import",
-                    if self.draft.is_some() {
-                        "继续导入整合包"
-                    } else {
-                        "导入整合包"
-                    },
-                )
-                .full_width()
-                .disabled(busy)
-                .on_click(cx.listener(|home, _, _, cx| home.import_pack(cx))),
-            )
-            .child(self.account_card(busy, cx))
-            .child(
-                Button::new("new", "新建实例")
-                    .icon(IconName::Plus)
-                    .full_width()
-                    .disabled(busy)
-                    .on_click(cx.listener(|home, _, _, cx| {
-                        home.page = Page::Create;
-                        home.status = "选择游戏版本与加载器".into();
-                        home.failed = false;
-                        home.fetch_versions(false, cx);
-                        cx.notify();
-                    })),
+                div()
+                    .flex_none()
+                    .border_t_1()
+                    .border_color(rgb(LINE))
+                    .pt_2()
+                    .child(self.account_card(busy, cx)),
             )
     }
 
@@ -1235,7 +1252,7 @@ impl Render for Home {
             Page::Mods => self.mods_page(cx).into_any_element(),
             Page::Console => self.console_page(cx).into_any_element(),
             Page::Settings => self.settings_page(cx).into_any_element(),
-            Page::Import => self.pack_page(cx).into_any_element(),
+            Page::Import => self.pack_page(frame, cx).into_any_element(),
             Page::Backups => self.backups_page(cx).into_any_element(),
         };
         let view = cx.weak_entity();
@@ -1281,9 +1298,10 @@ impl Render for Home {
                                     .id("main-scroll")
                                     .flex_1()
                                     .min_h_0()
-                                    .overflow_y_scroll()
-                                    .p_6()
-                                    .child(if matches!(self.page, Page::Detail) {
+                                    .when(self.page != Page::Import, |el| {
+                                        el.overflow_y_scroll().p_6()
+                                    })
+                                    .child(if matches!(self.page, Page::Detail | Page::Import) {
                                         page
                                     } else {
                                         frame.section(div().child(page), 0).into_any_element()

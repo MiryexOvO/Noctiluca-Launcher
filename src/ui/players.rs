@@ -1,7 +1,10 @@
 use super::*;
 use crate::accounts::{Kind, Player};
-use ely_gpui_component::overlays::Dialog;
-use ely_gpui_component::{buttons::IconButton, theme::ControlSize};
+use ely_gpui_component::{
+    buttons::ButtonVariant,
+    overlays::{Dialog, Popover},
+    primitives::FocusRing,
+};
 pub(super) struct Profiles {
     add: bool,
     kind: Kind,
@@ -26,7 +29,7 @@ fn default_face() -> Div {
         for pixel in pixels.bytes() {
             row = row.child(
                 div()
-                    .size(px(6.))
+                    .size(px(4.))
                     .bg(rgb(palette[usize::from(pixel - b'0')])),
             );
         }
@@ -152,73 +155,104 @@ impl Home {
                 .into_any_element();
         };
         let avatar = div()
-            .size(px(48.))
+            .size(px(32.))
+            .flex_none()
             .rounded_md()
             .overflow_hidden()
             .bg(rgb(SELECTED))
-            .flex()
-            .items_center()
-            .justify_center()
             .child(if let Some(path) = &self.profiles.avatar {
                 img(path.clone()).size_full().into_any_element()
             } else {
                 default_face().into_any_element()
             });
-        let actions = div()
+        let row = div()
+            .id("account-summary")
+            .role(Role::Button)
+            .aria_label(format!("管理账号，{}，{}", p.name, p.kind.label()))
             .flex()
             .items_center()
-            .justify_center()
-            .gap_1()
-            .child(
-                IconButton::new("skin", IconName::Palette)
-                    .size(ControlSize::Sm)
-                    .tooltip("皮肤与头像")
-                    .disabled(busy)
-                    .on_click(cx.listener(|h, _, _, cx| h.edit_character(true, cx))),
-            )
-            .child(
-                IconButton::new("change-name", IconName::Pencil)
-                    .size(ControlSize::Sm)
-                    .tooltip("管理角色名")
-                    .disabled(busy)
-                    .on_click(cx.listener(|h, _, _, cx| h.edit_character(false, cx))),
-            )
-            .child(
-                IconButton::new("profiles", IconName::Repeat)
-                    .size(ControlSize::Sm)
-                    .tooltip("切换账号")
-                    .disabled(busy)
-                    .on_click(cx.listener(|h, _, _, cx| h.open_accounts(cx))),
-            )
-            .child(
-                IconButton::new("add-profile", IconName::UserPlus)
-                    .size(ControlSize::Sm)
-                    .tooltip("添加账号")
-                    .disabled(busy)
-                    .on_click(cx.listener(|h, _, _, cx| {
-                        h.open_accounts(cx);
-                        h.profiles.add = true;
-                        cx.notify();
-                    })),
-            );
-        div()
-            .flex_none()
-            .rounded_lg()
-            .bg(rgb(PANEL))
+            .gap_2()
+            .rounded_md()
             .p_2()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap_1()
+            .bg(rgb(PANEL))
             .child(avatar)
             .child(
                 div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(p.name.clone()),
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(p.name.clone()),
+                    )
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(p.kind.label())),
             )
-            .child(kicker(p.kind.label()))
-            .child(actions)
-            .into_any_element()
+            .child(Icon::new(IconName::ChevronUp).color(rgb(MUTED)));
+        if busy {
+            return row.opacity(0.65).cursor_not_allowed().into_any_element();
+        }
+        let row = row
+            .tab_index(0)
+            .focus_ring(cx)
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(SELECTED)));
+        let view = cx.weak_entity();
+        Popover::with_opener(
+            "account-menu",
+            move |toggle| row.on_click(move |_, w, cx| toggle(w, cx)),
+            move |close, _, _| {
+                let item = |id, label, icon, action: fn(&mut Home, &mut Context<Home>)| {
+                    let view = view.clone();
+                    let close = close.clone();
+                    Button::new(id, label)
+                        .icon(icon)
+                        .variant(ButtonVariant::Ghost)
+                        .full_width()
+                        .on_click(move |_, w, cx| {
+                            close(w, cx);
+                            let _ = view.update(cx, action);
+                        })
+                };
+                div()
+                    .w(px(160.))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(item(
+                        "profiles",
+                        "切换账号",
+                        IconName::Repeat,
+                        Home::open_accounts,
+                    ))
+                    .child(item(
+                        "add-profile",
+                        "添加账号",
+                        IconName::UserPlus,
+                        |h, cx| {
+                            h.open_accounts(cx);
+                            h.profiles.add = true;
+                            cx.notify();
+                        },
+                    ))
+                    .child(item(
+                        "skin",
+                        "皮肤与头像",
+                        IconName::Palette,
+                        |h, cx| h.edit_character(true, cx),
+                    ))
+                    .child(item(
+                        "change-name",
+                        "管理角色名",
+                        IconName::Pencil,
+                        |h, cx| h.edit_character(false, cx),
+                    ))
+            },
+        )
+        .into_any_element()
     }
     pub(super) fn open_accounts(&mut self, cx: &mut Context<Self>) {
         self.launch_after_login = None;

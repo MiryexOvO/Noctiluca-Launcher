@@ -1,6 +1,6 @@
 use super::*;
 use crate::packs::Preview;
-use ely_gpui_component::forms::Checkbox;
+use ely_gpui_component::{buttons::ButtonVariant, forms::Checkbox, primitives::Tooltip};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -10,7 +10,9 @@ pub(super) struct Draft {
     optional: HashSet<usize>,
     supplied: HashSet<usize>,
     failed_file: Option<usize>,
-    page: usize,
+    missing_page: usize,
+    optional_page: usize,
+    optional_open: bool,
 }
 
 impl Draft {
@@ -57,7 +59,9 @@ impl Home {
                     optional: HashSet::new(),
                     supplied: HashSet::new(),
                     failed_file: None,
-                    page: 0,
+                    missing_page: 0,
+                    optional_page: 0,
+                    optional_open: false,
                 });
                 self.status = "整合包预览已就绪".into();
                 self.failed = false;
@@ -114,7 +118,7 @@ impl Home {
                     && let Some(file) = err.downcast_ref::<crate::download::FileFailure>()
                 {
                     draft.failed_file = draft.pack.files.iter().position(|f| f.path == file.label);
-                    draft.page = 0;
+                    draft.missing_page = 0;
                 }
                 self.message(Err(err), cx);
             }
@@ -198,201 +202,333 @@ impl Home {
         .detach();
     }
 
-    pub(super) fn pack_page(&self, cx: &Context<Self>) -> impl IntoElement {
+    pub(super) fn pack_page(&self, frame: motion::Frame, cx: &Context<Self>) -> impl IntoElement {
         let busy = self.cancel.is_some();
-        let mut page = div().flex().flex_col().gap_4().child(heading("导入整合包"));
-        if busy {
-            page = page.child(
-                Button::new("cancel-import", "取消当前操作").on_click(cx.listener(
-                    |home, _, _, cx| {
-                        if let Some(cancel) = &home.cancel {
-                            cancel.store(true, Ordering::Release);
-                        }
-                        cx.notify();
-                    },
-                )),
-            );
-        }
-        let Some(draft) = &self.draft else {
-            return page.when(!busy, |el| {
+        let mut body = div().flex().flex_col().gap_4();
+        let mut footer = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_end()
+            .flex_wrap()
+            .gap_2()
+            .border_t_1()
+            .border_color(rgb(LINE))
+            .px_6()
+            .py_3();
+        if let Some(draft) = &self.draft {
+            let pack = &draft.pack;
+            let item = &pack.instance;
+            let source = if pack.curse { "CurseForge" } else { "Modrinth" };
+            let loader = match &item.loader_version {
+                Some(version) => format!("{} {version}", item.loader.label()),
+                None => item.loader.label().to_owned(),
+            };
+            body = body
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .child(div().min_w_0().flex_1().child(heading(&item.name)))
+                        .child(
+                            Button::new("choose-another-pack", "选择其他整合包")
+                                .variant(ButtonVariant::Ghost)
+                                .disabled(busy)
+                                .on_click(cx.listener(|h, _, _, cx| h.pick_pack(cx))),
+                        ),
+                )
+                .child(kicker(&format!(
+                    "{source}  ·  Minecraft {}  ·  {loader}  ·  {} 个必需文件",
+                    item.version, pack.required_count
+                )));
+            if let Some(error) = &pack.metadata_error {
+                body = body.child(panel("无法读取依赖文件信息").child(error.clone()));
+                let path = draft.path.clone();
+                footer = footer.child(
+                    Button::new("retry-manifest", "重新读取清单")
+                        .primary()
+                        .disabled(busy)
+                        .on_click(cx.listener(move |h, _, _, cx| {
+                            h.install_pack(hub::Pack::Local(path.clone()), cx)
+                        })),
+                );
+            } else {
+                let missing: Vec<_> = (0..pack.files.len())
+                    .filter(|&i| draft.missing(i))
+                    .collect();
+                let (visible_missing, missing_pager) =
+                    self.file_page(&missing, false, draft.missing_page, cx);
+                if !missing.is_empty() {
+                    let mut list = panel(&format!("还需补齐 {} 个文件", missing.len()));
+                    for &i in visible_missing {
+                        list = list.child(self.missing_file_row(
+                            draft,
+                            i,
+                            missing.len() > 1,
+                            busy,
+                            cx,
+                        ));
+                    }
+                    body = body.child(list.children(missing_pager));
+                }
+                if let Some(i) = draft.failed_file
+                    && draft.selected(i)
+                    && !draft.missing(i)
+                    && !draft.supplied.contains(&i)
+                {
+                    body = body.child(
+                        panel("下载失败，可重新安装或手动补齐")
+                            .child(self.missing_file_row(draft, i, true, busy, cx)),
+                    );
+                }
+                if let Some(error) = &pack.optional_error {
+                    body = body.child(
+                        panel("可选文件信息暂不可用，可继续安装必需内容").child(error.clone()),
+                    );
+                } else if pack.optional_count > 0 {
+                    body = body.child(self.optional_files(draft, busy, cx));
+                }
+                if let Some(&i) = visible_missing.first() {
+                    let path = pack.files[i].path.clone();
+                    footer = footer
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .text_color(rgb(MUTED))
+                                .truncate()
+                                .child(format!("待补齐  ·  {path}")),
+                        )
+                        .child(
+                            Button::new("next-manual-file", "选择已下载文件")
+                                .primary()
+                                .disabled(busy)
+                                .on_click(cx.listener(move |h, _, _, cx| h.pick_dependency(i, cx))),
+                        );
+                } else {
+                    footer = footer
+                        .child(
+                            Button::new("install-pack-only", "仅安装")
+                                .disabled(busy)
+                                .on_click(cx.listener(|h, _, _, cx| h.confirm_pack(false, cx))),
+                        )
+                        .child(
+                            Button::new("install-and-launch", "安装并启动")
+                                .primary()
+                                .disabled(busy)
+                                .on_click(cx.listener(|h, _, _, cx| h.confirm_pack(true, cx))),
+                        );
+                }
+            }
+        } else {
+            body = body.child(heading("导入整合包")).when(!busy, |el| {
                 el.child(kicker(
                     "将一个 .mrpack 或 .zip 文件拖入窗口，或从本机选择。",
                 ))
-                .child(
+            });
+            footer = footer.when(!busy, |el| {
+                el.child(
                     Button::new("choose-pack", "选择整合包")
+                        .primary()
                         .on_click(cx.listener(|h, _, _, cx| h.pick_pack(cx))),
                 )
             });
-        };
-        let pack = &draft.pack;
-        let item = &pack.instance;
-        let source = if pack.curse { "CurseForge" } else { "Modrinth" };
-        page = page.child(
-            panel(source)
-                .child(
-                    div()
-                        .text_xl()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(item.name.clone()),
-                )
-                .child(format!(
-                    "Minecraft {}    /    {} {}",
-                    item.version,
-                    item.loader.label(),
-                    item.loader_version.as_deref().unwrap_or("")
-                ))
-                .child(kicker(&format!(
-                    "必需文件 {} 个    ·    可选文件已选 {} / {}",
-                    pack.required_count,
-                    draft.optional.len(),
-                    pack.optional_count
-                ))),
-        );
-        if let Some(error) = &pack.optional_error {
-            page =
-                page.child(panel("可选文件信息暂不可用，可继续安装必需内容").child(error.clone()));
         }
-        let mut actions = div().flex().flex_wrap().gap_2();
-        if let Some(error) = &pack.metadata_error {
-            page = page.child(panel("无法读取依赖文件信息").child(error.clone()));
-            let path = draft.path.clone();
-            actions = actions.child(
-                Button::new("retry-manifest", "重新读取清单")
-                    .disabled(busy)
-                    .on_click(cx.listener(move |h, _, _, cx| {
-                        h.install_pack(hub::Pack::Local(path.clone()), cx)
-                    })),
-            );
-        } else {
-            let missing = (0..pack.files.len()).filter(|&i| draft.missing(i)).count();
-            let mut rows: Vec<_> = (0..pack.files.len())
-                .filter(|&i| {
-                    pack.files[i].optional()
-                        || draft.missing(i)
-                        || draft.supplied.contains(&i)
-                        || draft.failed_file == Some(i)
-                })
-                .collect();
-            rows.sort_by_key(|&i| (draft.failed_file != Some(i), !draft.missing(i)));
-            let pages = rows.len().div_ceil(8);
-            let current = draft.page.min(pages.saturating_sub(1));
-            if !rows.is_empty() {
-                let mut list = panel(&format!("文件选择    ·    待补齐 {missing} 个"));
-                for &i in rows.iter().skip(current * 8).take(8) {
-                    list = list.child(self.dependency_row(draft, i, busy, cx));
-                }
-                if pages > 1 {
-                    list = list.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Button::new("previous-pack-page", "上一页")
-                                    .disabled(current == 0)
-                                    .on_click(cx.listener(move |h, _, _, cx| {
-                                        if let Some(d) = &mut h.draft {
-                                            d.page = current.saturating_sub(1);
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(kicker(&format!("{} / {pages}", current + 1)))
-                            .child(
-                                Button::new("next-pack-page", "下一页")
-                                    .disabled(current + 1 >= pages)
-                                    .on_click(cx.listener(move |h, _, _, cx| {
-                                        if let Some(d) = &mut h.draft {
-                                            d.page = current + 1;
-                                        }
-                                        cx.notify();
-                                    })),
-                            ),
-                    );
-                }
-                page = page.child(list);
-            }
-            actions = actions
-                .child(
-                    Button::new("install-and-launch", "安装并启动")
-                        .primary()
-                        .disabled(busy || missing > 0)
-                        .on_click(cx.listener(|h, _, _, cx| h.confirm_pack(true, cx))),
-                )
-                .child(
-                    Button::new("install-pack-only", "仅安装")
-                        .disabled(busy || missing > 0)
-                        .on_click(cx.listener(|h, _, _, cx| h.confirm_pack(false, cx))),
-                );
+        if busy {
+            footer = footer.child(Button::new("cancel-import", "取消当前操作").on_click(
+                cx.listener(|h, _, _, cx| {
+                    if let Some(cancel) = &h.cancel {
+                        cancel.store(true, Ordering::Release);
+                    }
+                    cx.notify();
+                }),
+            ));
         }
-        page.child(
-            actions.child(
-                Button::new("choose-another-pack", "选择其他整合包")
-                    .disabled(busy)
-                    .on_click(cx.listener(|h, _, _, cx| h.pick_pack(cx))),
-            ),
-        )
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("pack-preview-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_6()
+                    .child(frame.section(body, 0)),
+            )
+            .child(footer)
     }
 
-    fn dependency_row(&self, draft: &Draft, i: usize, busy: bool, cx: &Context<Self>) -> Div {
-        let file = &draft.pack.files[i];
-        let view = cx.weak_entity();
-        let mut row = div().flex().flex_wrap().items_center().gap_2();
-        if file.optional() {
-            row = row.child(
-                Checkbox::new(("optional-pack-file", i), draft.optional.contains(&i))
-                    .label(file.path.clone())
-                    .disabled(busy)
-                    .on_change(move |checked, _, cx| {
-                        let _ = view.update(cx, |h, cx| {
-                            if let Some(d) = &mut h.draft {
-                                if checked {
-                                    d.optional.insert(i);
-                                } else {
-                                    d.optional.remove(&i);
-                                }
-                            }
-                            cx.notify();
-                        });
-                    }),
-            );
+    fn optional_files(&self, draft: &Draft, busy: bool, cx: &Context<Self>) -> Div {
+        let pack = &draft.pack;
+        let toggle = Button::new(
+            "toggle-optionals",
+            format!(
+                "可选文件  ·  已选 {} / {}",
+                draft.optional.len(),
+                pack.optional_count
+            ),
+        )
+        .icon(if draft.optional_open {
+            IconName::ChevronDown
         } else {
-            row = row.child(file.path.clone());
+            IconName::ChevronRight
+        })
+        .variant(ButtonVariant::Ghost)
+        .on_click(cx.listener(|h, _, _, cx| {
+            if let Some(d) = &mut h.draft {
+                d.optional_open = !d.optional_open;
+            }
+            cx.notify();
+        }));
+        let mut options = div()
+            .rounded_lg()
+            .bg(rgb(PANEL))
+            .px_3()
+            .py_2()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().flex().child(toggle));
+        if draft.optional_open {
+            let optional: Vec<_> = pack
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.optional())
+                .map(|(i, _)| i)
+                .collect();
+            let (visible, pager) = self.file_page(&optional, true, draft.optional_page, cx);
+            for &i in visible {
+                let label = pack.files[i].path.clone();
+                let view = cx.weak_entity();
+                options = options.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Checkbox::new(("optional-pack-file", i), draft.optional.contains(&i))
+                                .label(label)
+                                .disabled(busy)
+                                .on_change(move |checked, _, cx| {
+                                    let _ = view.update(cx, |h, cx| {
+                                        if let Some(d) = &mut h.draft {
+                                            if checked {
+                                                d.optional.insert(i);
+                                            } else {
+                                                d.optional.remove(&i);
+                                            }
+                                            d.missing_page = 0;
+                                        }
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .when(draft.supplied.contains(&i), |row| {
+                            row.child(kicker("已校验"))
+                        }),
+                );
+            }
+            options = options.children(pager);
         }
-        if draft.supplied.contains(&i) {
-            row = row.child(kicker("已校验"));
-        } else if draft.missing(i) || draft.failed_file == Some(i) {
-            row = row.child(kicker(if draft.failed_file == Some(i) {
-                "下载失败，可重试安装或手动补齐"
-            } else {
-                "需手动补齐"
-            }));
-            if let Some(url) = file.website() {
-                row = row.child(Button::new(("pack-website", i), "打开下载页").on_click(
-                    cx.listener(move |h, _, _, cx| {
-                        h.message(open::that_detached(&url).map_err(Into::into), cx)
-                    }),
-                ));
-            } else {
-                let filename = Path::new(&file.path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy();
-                if let Ok(url) = url::Url::parse_with_params(
+        options
+    }
+
+    fn file_page<'a>(
+        &self,
+        rows: &'a [usize],
+        optional: bool,
+        page: usize,
+        cx: &Context<Self>,
+    ) -> (&'a [usize], Option<Div>) {
+        const PER_PAGE: usize = 8;
+        let pages = rows.len().div_ceil(PER_PAGE);
+        let page = page.min(pages.saturating_sub(1));
+        let start = page * PER_PAGE;
+        let visible = &rows[start..(start + PER_PAGE).min(rows.len())];
+        let pager = (pages > 1).then(|| {
+            let change = move |h: &mut Home, to: usize, cx: &mut Context<Home>| {
+                if let Some(d) = &mut h.draft {
+                    if optional {
+                        d.optional_page = to;
+                    } else {
+                        d.missing_page = to;
+                    }
+                }
+                cx.notify();
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Button::new(("pack-prev", usize::from(optional)), "上一页")
+                        .disabled(page == 0)
+                        .on_click(
+                            cx.listener(move |h, _, _, cx| change(h, page.saturating_sub(1), cx)),
+                        ),
+                )
+                .child(kicker(&format!("{} / {pages}", page + 1)))
+                .child(
+                    Button::new(("pack-next", usize::from(optional)), "下一页")
+                        .disabled(page + 1 >= pages)
+                        .on_click(cx.listener(move |h, _, _, cx| change(h, page + 1, cx))),
+                )
+        });
+        (visible, pager)
+    }
+
+    fn missing_file_row(
+        &self,
+        draft: &Draft,
+        i: usize,
+        manual_action: bool,
+        busy: bool,
+        cx: &Context<Self>,
+    ) -> Div {
+        let file = &draft.pack.files[i];
+        let mut row = div().flex().flex_wrap().items_center().gap_2().child(
+            div()
+                .id(("pack-file-name", i))
+                .flex_1()
+                .min_w(px(130.))
+                .truncate()
+                .tooltip(Tooltip::text(file.path.clone()))
+                .child(file.path.clone()),
+        );
+        let (label, url) = if let Some(url) = file.website() {
+            ("打开下载页", Some(url))
+        } else {
+            let filename = Path::new(&file.path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            (
+                "在 Modrinth 查找",
+                url::Url::parse_with_params(
                     "https://modrinth.com/discover/mods",
                     &[("q", filename.as_ref())],
-                ) {
-                    row = row.child(
-                        Button::new(("pack-search", i), "在 Modrinth 查找").on_click(cx.listener(
-                            move |h, _, _, cx| {
-                                h.message(open::that_detached(url.as_str()).map_err(Into::into), cx)
-                            },
-                        )),
-                    );
-                }
-            }
+                )
+                .ok()
+                .map(Into::into),
+            )
+        };
+        if let Some(url) = url {
             row = row.child(
-                Button::new(("pack-manual", i), "选择已下载文件")
+                Button::new(("pack-site", i), label)
+                    .variant(ButtonVariant::Link)
+                    .on_click(cx.listener(move |h, _, _, cx| {
+                        h.message(open::that_detached(&url).map_err(Into::into), cx)
+                    })),
+            );
+        }
+        if manual_action {
+            row = row.child(
+                Button::new(("pack-manual", i), "选择文件")
                     .disabled(busy)
                     .on_click(cx.listener(move |h, _, _, cx| h.pick_dependency(i, cx))),
             );
