@@ -24,7 +24,13 @@ pub fn client() -> Result<Client> {
 }
 
 pub fn client_builder() -> reqwest::blocking::ClientBuilder {
-    Client::builder()
+    let builder = Client::builder();
+    let builder = if crate::preferences::current().protocol == 1 {
+        builder.http1_only()
+    } else {
+        builder
+    };
+    builder
         .user_agent(format!("{}/{}", crate::APP_NAME, env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(180))
@@ -64,7 +70,9 @@ impl<'a> Downloads<'a> {
             cancel,
             cache_source: None,
             report,
-            pool: rayon::ThreadPoolBuilder::new().num_threads(8).build()?,
+            pool: rayon::ThreadPoolBuilder::new()
+                .num_threads(usize::from(crate::preferences::current().connections))
+                .build()?,
         })
     }
 
@@ -144,16 +152,18 @@ impl<'a> Downloads<'a> {
                 }
             }
         }
+        let prefs = crate::preferences::current();
+        let urls = if task.checksum.is_some() {
+            crate::preferences::sources(&task.url, prefs.files)
+        } else {
+            vec![task.url.clone()]
+        };
         for attempt in 1..=3 {
             self.check()?;
             let result = (|| -> Result<()> {
-                let mut response = self.http.get(&task.url).send()?.error_for_status()?;
+                let source = &urls[((attempt - 1) as usize).min(urls.len() - 1)];
                 let mut tmp = NamedTempFile::new_in(dir)?;
-                let expected_length = response.content_length();
-                let bytes = io::copy(&mut response, &mut tmp)?;
-                if let Some(length) = expected_length {
-                    ensure!(bytes == length, "下载文件不完整");
-                }
+                let bytes = transfer(self, source, &mut tmp, &prefs)?;
                 match &task.checksum {
                     Some(Checksum::Sha1(expected)) => ensure!(
                         sha1_file(tmp.path())?.eq_ignore_ascii_case(expected),
@@ -178,4 +188,109 @@ impl<'a> Downloads<'a> {
         }
         unreachable!()
     }
+}
+
+fn copy_limited(
+    d: &Downloads,
+    input: &mut impl io::Read,
+    out: &mut impl io::Write,
+    limit: u16,
+) -> Result<u64> {
+    static NEXT: std::sync::LazyLock<Mutex<Instant>> =
+        std::sync::LazyLock::new(|| Mutex::new(Instant::now()));
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0;
+    loop {
+        d.check()?;
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if limit > 0 {
+            let delay = {
+                let mut next = NEXT.lock().unwrap();
+                let now = Instant::now();
+                let begin = (*next).max(now);
+                *next =
+                    begin + Duration::from_secs_f64(n as f64 / (f64::from(limit) * 1024. * 1024.));
+                begin.saturating_duration_since(now)
+            };
+            std::thread::sleep(delay);
+        }
+        out.write_all(&buf[..n])?;
+        total += n as u64;
+    }
+    Ok(total)
+}
+fn transfer(
+    d: &Downloads,
+    url: &str,
+    out: &mut NamedTempFile,
+    prefs: &crate::preferences::Prefs,
+) -> Result<u64> {
+    use std::io::{Seek, SeekFrom};
+    let streams = usize::from(prefs.streams.min(prefs.connections));
+    if streams > 1
+        && let Ok(head) = d.http.head(url).send()
+        && head.status().is_success()
+        && head
+            .headers()
+            .get("accept-ranges")
+            .and_then(|h| h.to_str().ok())
+            == Some("bytes")
+        && let Some(size) = head
+            .headers()
+            .get("content-length")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+        && size >= 2 * 1024 * 1024
+    {
+        let chunk = size.div_ceil(streams as u64);
+        let tmp = out.path().parent().context("下载目录无效")?;
+        let result = d.pool.install(|| {
+            (0..streams)
+                .into_par_iter()
+                .map(|i| -> Result<NamedTempFile> {
+                    d.check()?;
+                    let from = chunk * i as u64;
+                    let to = (from + chunk).min(size) - 1;
+                    let mut response = d
+                        .http
+                        .get(url)
+                        .header("Range", format!("bytes={from}-{to}"))
+                        .send()?
+                        .error_for_status()?;
+                    ensure!(
+                        response.status() == reqwest::StatusCode::PARTIAL_CONTENT
+                            && response
+                                .headers()
+                                .get("content-range")
+                                .and_then(|v| v.to_str().ok())
+                                == Some(&format!("bytes {from}-{to}/{size}")),
+                        "服务器未接受分段请求"
+                    );
+                    let mut part = NamedTempFile::new_in(tmp)?;
+                    ensure!(
+                        copy_limited(d, &mut response, &mut part, prefs.limit)? == to - from + 1,
+                        "分段长度错误"
+                    );
+                    part.seek(SeekFrom::Start(0))?;
+                    Ok(part)
+                })
+                .collect::<Result<Vec<_>>>()
+        });
+        if let Ok(parts) = result {
+            for mut p in parts {
+                d.check()?;
+                io::copy(&mut p, out)?;
+            }
+            return Ok(size);
+        }
+    }
+    d.check()?;
+    let mut response = d.http.get(url).send()?.error_for_status()?;
+    let length = response.content_length();
+    let count = copy_limited(d, &mut response, out, prefs.limit)?;
+    ensure!(length.is_none_or(|v| v == count), "下载文件不完整");
+    Ok(count)
 }

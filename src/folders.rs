@@ -196,7 +196,11 @@ pub fn scan(folder: &Path) -> Result<Vec<Found>> {
             continue;
         };
         if let Some((version, loader, build)) = metadata(&value, &profile) {
-            let isolated = isolated_layout(&entry.path());
+            let isolated = match crate::preferences::current().isolated {
+                1 => true,
+                2 => false,
+                _ => isolated_layout(&entry.path()),
+            };
             found.push(Found {
                 origin: Origin {
                     folder: dunce::simplified(folder).to_owned(),

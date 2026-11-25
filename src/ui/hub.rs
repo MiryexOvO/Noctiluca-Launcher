@@ -4,12 +4,15 @@ use crate::market::{self, Hit, Release, Source};
 
 pub(super) enum Pack {
     Local(PathBuf),
+    UpdateLocal(PathBuf, Instance),
+    UpdateOnline(Release, Instance),
+    Retry(PathBuf, Option<crate::content::Upstream>, Option<Instance>),
     Online(Release),
 }
 pub(super) struct Hub {
     pub(super) packs: bool,
     loader: Loader,
-    source: Source,
+    pub(super) source: Source,
     mc: Entity<TextInput>,
     query: Entity<TextInput>,
     builds: Vec<String>,
@@ -27,7 +30,11 @@ impl Hub {
         Self {
             packs: false,
             loader: Loader::NeoForge,
-            source: Source::Modrinth,
+            source: if crate::preferences::current().community == 1 {
+                Source::CurseForge
+            } else {
+                Source::Modrinth
+            },
             mc: cx.new(|cx| {
                 TextInput::new(window, cx)
                     .label("Minecraft 版本")
@@ -51,7 +58,7 @@ impl Hub {
             loading: false,
         }
     }
-    fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         self.builds.clear();
         self.hits.clear();
         self.releases.clear();
@@ -83,13 +90,27 @@ impl Home {
                 let _ = tx.try_send(Update::Status(s));
             };
             let result = (|| -> Result<_> {
-                let path = match pack {
-                    Pack::Local(p) => p,
-                    Pack::Online(file) => {
-                        file.archive(&root, &Downloads::new(&cancel, &report)?)?
+                let mut retry_origin = None;
+                let (file, target) = match pack {
+                    Pack::Retry(path, origin, target) => {
+                        retry_origin = origin;
+                        (Ok(path), target)
                     }
+                    Pack::Local(path) => (Ok(path), None),
+                    Pack::UpdateLocal(path, item) => (Ok(path), Some(item)),
+                    Pack::Online(file) => (Err(file), None),
+                    Pack::UpdateOnline(file, item) => (Err(file), Some(item)),
                 };
-                let preview = crate::packs::preview(&root, &path)?;
+                let (path, upstream) = match file {
+                    Ok(path) => (path, None),
+                    Err(file) => (
+                        file.archive(&root, &Downloads::new(&cancel, &report)?)?,
+                        Some(crate::content::Upstream::from(&file)),
+                    ),
+                };
+                let mut preview = crate::packs::preview(&root, &path)?;
+                preview.upstream = upstream.or(retry_origin);
+                preview.target = target;
                 anyhow::ensure!(!cancel.load(Ordering::Relaxed), "已取消预览");
                 Ok((path, Box::new(preview)))
             })();
@@ -188,10 +209,14 @@ impl Home {
         let mut item = Instance::new(format!("{} {} · {}", loader.label(), mc, build), mc, loader)?;
         item.loader_version = Some(build);
         library::save(&self.root, &item)?;
+        let previous = self.selected;
         self.instances.push(item);
         self.selected = self.instances.len() - 1;
         self.page = Page::Detail;
         self.play(true, cx);
+        if !crate::preferences::current().select_new {
+            self.selected = previous;
+        }
         Ok(())
     }
     pub(super) fn hub_page(&self, cx: &Context<Self>) -> impl IntoElement {

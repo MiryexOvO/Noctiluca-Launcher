@@ -53,10 +53,15 @@ impl Home {
         self.cancel = None;
         match result {
             Ok((path, pack)) => {
+                let selected = if let Some(item) = &pack.target {
+                    crate::content::previous_options(&self.root, item, &pack)
+                } else {
+                    HashSet::new()
+                };
                 self.draft = Some(Draft {
                     pack: Arc::from(pack),
                     path,
-                    optional: HashSet::new(),
+                    optional: selected,
                     supplied: HashSet::new(),
                     failed_file: None,
                     missing_page: 0,
@@ -65,6 +70,17 @@ impl Home {
                 });
                 self.status = "整合包预览已就绪".into();
                 self.failed = false;
+                if crate::preferences::current().quick == 1
+                    && self.draft.as_ref().is_some_and(|d| {
+                        d.pack.upstream.is_some()
+                            && d.pack.target.is_none()
+                            && d.pack.metadata_error.is_none()
+                            && d.pack.optional_count == 0
+                            && !(0..d.pack.files.len()).any(|i| d.missing(i))
+                    })
+                {
+                    self.confirm_pack(false, cx);
+                }
             }
             Err(e) => self.message(Err(e), cx),
         }
@@ -93,13 +109,28 @@ impl Home {
                 let _ = tx.try_send(Update::Status(s));
             };
             let result = (|| {
-                let item = pack.install(&root, &optional, &cancel, report)?;
+                let prepared = if let Some(current) = &pack.target {
+                    let mut requested = pack.instance.clone();
+                    requested.java_path = current.java_path.clone();
+                    Some(game::stage_loader(&root, &requested, &cancel, &report)?)
+                } else {
+                    None
+                };
+                let item = if let Some(pin) = &prepared {
+                    pack.install_prepared(&root, &optional, &cancel, report, pin.as_deref())?
+                } else {
+                    pack.install(&root, &optional, &cancel, report)?
+                };
                 let _ = tx.try_send(Update::Imported(Box::new(item.clone())));
-                game::play(&root, &item, None, true, &cancel, report)
+                if prepared.is_some() {
+                    Ok(())
+                } else {
+                    game::play(&root, &item, None, true, &cancel, report)
+                }
             })();
             let _ = tx.try_send(Update::PackFinished(
                 result,
-                launch.then(|| pack.instance.id.clone()),
+                launch.then(|| pack.target.as_ref().unwrap_or(&pack.instance).id.clone()),
             ));
         });
         self.listen(rx, cx);
@@ -219,7 +250,7 @@ impl Home {
         if let Some(draft) = &self.draft {
             let pack = &draft.pack;
             let item = &pack.instance;
-            let source = if pack.curse { "CurseForge" } else { "Modrinth" };
+            let source = pack.format;
             let loader = match &item.loader_version {
                 Some(version) => format!("{} {version}", item.loader.label()),
                 None => item.loader.label().to_owned(),
@@ -239,18 +270,28 @@ impl Home {
                         ),
                 )
                 .child(kicker(&format!(
-                    "{source}  ·  Minecraft {}  ·  {loader}  ·  {} 个必需文件",
-                    item.version, pack.required_count
+                    "{}{source}  ·  Minecraft {}  ·  {loader}  ·  {} 个必需文件",
+                    pack.target
+                        .as_ref()
+                        .map(|t| format!("更新「{}」 · ", t.name))
+                        .unwrap_or_default(),
+                    item.version,
+                    pack.required_count
                 )));
             if let Some(error) = &pack.metadata_error {
                 body = body.child(panel("无法读取依赖文件信息").child(error.clone()));
                 let path = draft.path.clone();
+                let origin = pack.upstream.clone();
+                let target = pack.target.clone();
                 footer = footer.child(
                     Button::new("retry-manifest", "重新读取清单")
                         .primary()
                         .disabled(busy)
                         .on_click(cx.listener(move |h, _, _, cx| {
-                            h.install_pack(hub::Pack::Local(path.clone()), cx)
+                            h.install_pack(
+                                hub::Pack::Retry(path.clone(), origin.clone(), target.clone()),
+                                cx,
+                            )
                         })),
                 );
             } else {
@@ -310,15 +351,29 @@ impl Home {
                 } else {
                     footer = footer
                         .child(
-                            Button::new("install-pack-only", "仅安装")
-                                .disabled(busy)
-                                .on_click(cx.listener(|h, _, _, cx| h.confirm_pack(false, cx))),
+                            Button::new(
+                                "install-pack-only",
+                                if pack.target.is_some() {
+                                    "备份并更新"
+                                } else {
+                                    "仅安装"
+                                },
+                            )
+                            .disabled(busy)
+                            .on_click(cx.listener(|h, _, _, cx| h.confirm_pack(false, cx))),
                         )
                         .child(
-                            Button::new("install-and-launch", "安装并启动")
-                                .primary()
-                                .disabled(busy)
-                                .on_click(cx.listener(|h, _, _, cx| h.confirm_pack(true, cx))),
+                            Button::new(
+                                "install-and-launch",
+                                if pack.target.is_some() {
+                                    "更新并启动"
+                                } else {
+                                    "安装并启动"
+                                },
+                            )
+                            .primary()
+                            .disabled(busy)
+                            .on_click(cx.listener(|h, _, _, cx| h.confirm_pack(true, cx))),
                         );
                 }
             }

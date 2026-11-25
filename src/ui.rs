@@ -1,9 +1,11 @@
+mod content;
 mod hub;
 mod instance_controls;
 mod manager;
 mod motion;
 mod pack_import;
 mod players;
+mod preferences;
 mod settings;
 mod titlebar;
 use std::{
@@ -57,7 +59,14 @@ pub fn apply_palette(cx: &mut App) {
         ("fg", INK),
         ("fg_muted", MUTED),
         ("fg_subtle", 0xb9adbf),
-        ("accent", ACCENT),
+        (
+            "accent",
+            match crate::preferences::current().accent {
+                1 => 0xb1c8eb,
+                2 => 0xe4b7cd,
+                _ => ACCENT,
+            },
+        ),
         ("accent_hover", 0xe1c5f0),
         ("on_accent", 0x302638),
         ("focus", ACCENT),
@@ -79,6 +88,9 @@ enum Page {
     Hub,
     Settings,
     Console,
+    Files,
+    Content,
+    Preferences,
     Import,
     Backups,
     Mods,
@@ -90,6 +102,7 @@ enum Update {
     Started(String, u32),
     Exited(String, Result<()>),
     Imported(Box<Instance>),
+    Changed(Box<Instance>),
     PackPreview(Result<(PathBuf, Box<crate::packs::Preview>)>),
     PackFinished(Result<()>, Option<String>),
     Status(String),
@@ -97,6 +110,8 @@ enum Update {
 }
 
 pub struct Home {
+    prefs: preferences::Settings,
+    content: content::Tools,
     profiles: players::Profiles,
     draft: Option<pack_import::Draft>,
     controls: instance_controls::Controls,
@@ -120,6 +135,7 @@ pub struct Home {
     mod_query: Entity<TextInput>,
     hits: Vec<mods::Hit>,
     jars: Vec<String>,
+    mod_labels: std::collections::HashMap<String, String>,
     searching: bool,
     copying: bool,
     backups: Vec<backups::Backup>,
@@ -165,8 +181,8 @@ impl Home {
         let subscription = cx.observe(&query, |_, _, cx| cx.notify());
         let mod_query = cx.new(|cx| {
             TextInput::new(window, cx)
-                .label("搜索 Modrinth")
-                .placeholder("输入模组名称")
+                .label("搜索内容")
+                .placeholder("输入项目名称")
                 .max_len(100)
         });
         let initial_page = if instances.is_empty() {
@@ -175,13 +191,16 @@ impl Home {
             Page::Detail
         };
         let mut home = Self {
+            prefs: preferences::Settings::new(window, cx),
+            content: Default::default(),
             profiles: players::Profiles::new(window, cx),
             draft: None,
             controls: instance_controls::Controls::new(&root),
             navigation: Default::default(),
-            _motion_preference: cx.observe_window_activation(window, |_, window, cx| {
+            _motion_preference: cx.observe_window_activation(window, |home, window, cx| {
                 if window.is_window_active() {
                     motion::sync_preference(cx);
+                    home.activate_clipboard(cx);
                 }
             }),
             launch_after_login: None,
@@ -202,6 +221,7 @@ impl Home {
             mod_query,
             hits: Vec::new(),
             jars: Vec::new(),
+            mod_labels: Default::default(),
             searching: false,
             copying: false,
             backups: Vec::new(),
@@ -230,6 +250,10 @@ impl Home {
             }
         }
         home.refresh_avatar(cx);
+        let pref = crate::preferences::current();
+        if pref.stable || pref.snapshots {
+            home.fetch_versions(true, cx);
+        }
         home
     }
 
@@ -314,6 +338,9 @@ impl Home {
                         match update {
                             Update::Started(id, pid) => {
                                 home.running.insert(id, pid);
+                                if crate::preferences::current().visibility == 1 {
+                                    home.prefs.minimize = true;
+                                }
                                 home.cancel = None;
                                 home.status = format!("游戏运行中 · PID {pid}");
                             }
@@ -341,10 +368,27 @@ impl Home {
                             Update::PackFinished(result, launch) => {
                                 home.pack_finished(result, launch, cx)
                             }
+                            Update::Changed(item) => {
+                                if let Some(i) = home.instances.iter().position(|v| v.id == item.id)
+                                {
+                                    home.instances[i] = *item;
+                                }
+                                home.content.builds.clear();
+                            }
                             Update::Imported(item) => {
                                 home.draft = None;
-                                home.instances.push(*item);
-                                home.selected = home.instances.len() - 1;
+                                if let Some(i) = home.instances.iter().position(|x| x.id == item.id)
+                                {
+                                    home.instances[i] = *item;
+                                    home.selected = i;
+                                } else {
+                                    home.instances.push(*item);
+                                    if crate::preferences::current().select_new
+                                        || home.instances.len() == 1
+                                    {
+                                        home.selected = home.instances.len() - 1;
+                                    }
+                                }
                                 home.page = Page::Detail;
                             }
                             Update::Status(text) => {
@@ -353,6 +397,10 @@ impl Home {
                             Update::Finished(result, success) => {
                                 home.cancel = None;
                                 home.status = success.into();
+                                if home.page == Page::Files && result.is_ok() {
+                                    home.browse_files(home.content.label, home.content.kind, cx);
+                                    home.status = success.into();
+                                }
                                 if matches!(home.page, Page::Mods) {
                                     home.refresh_mods(cx);
                                 }
@@ -385,7 +433,35 @@ impl Home {
             let _ = view.update(cx, |home, cx| {
                 home.fetching = false;
                 match result {
-                    Ok(versions) => home.versions = versions,
+                    Ok(versions) => {
+                        let p = crate::preferences::current();
+                        if refresh && (p.stable || p.snapshots) {
+                            let seen = home.root.join("notified-versions.json");
+                            let mut known: std::collections::BTreeMap<String, String> =
+                                fs::read(&seen)
+                                    .ok()
+                                    .and_then(|v| serde_json::from_slice(&v).ok())
+                                    .unwrap_or_default();
+                            let mut news = vec![];
+                            for (kind, want) in [("release", p.stable), ("snapshot", p.snapshots)] {
+                                if want
+                                    && let Some(v) = versions.iter().find(|v| v.kind == kind)
+                                    && known.insert(kind.into(), v.id.clone()).as_ref()
+                                        != Some(&v.id)
+                                {
+                                    news.push(v.id.clone());
+                                }
+                            }
+                            if !news.is_empty() {
+                                home.status = format!("Minecraft 版本更新 · {}", news.join(" / "));
+                                let _ = library::atomic_write(
+                                    &seen,
+                                    &serde_json::to_vec(&known).unwrap_or_default(),
+                                );
+                            }
+                        }
+                        home.versions = versions;
+                    }
                     Err(e) => home.message(Err(e), cx),
                 }
                 cx.notify();
@@ -405,7 +481,9 @@ impl Home {
         let item = Instance::new(self.name.read(cx).text().into(), version, self.loader)?;
         library::save(&self.root, &item)?;
         self.instances.push(item);
-        self.selected = self.instances.len() - 1;
+        if crate::preferences::current().select_new || self.instances.len() == 1 {
+            self.selected = self.instances.len() - 1;
+        }
         self.page = Page::Detail;
         self.status = "实例已创建".into();
         self.failed = false;
@@ -420,13 +498,13 @@ impl Home {
             } else {
                 item.path(&self.root).join(relative)
             };
-            if relative.ends_with(".log") {
-                ensure!(path.is_file(), "这次启动尚未生成该日志");
-                Command::new("notepad.exe").arg(path).spawn()?;
-            } else {
-                fs::create_dir_all(&path)?;
-                Command::new("explorer.exe").arg(path).spawn()?;
-            }
+            ensure!(
+                relative.ends_with(".log") && path.is_file(),
+                "这次启动尚未生成该日志"
+            );
+            Command::new("notepad.exe")
+                .arg(dunce::canonicalize(path)?)
+                .spawn()?;
             Ok(())
         })();
         self.message(result, cx)
@@ -597,6 +675,16 @@ impl Home {
                     })),
             )
             .child(
+                Button::new("launcher-settings", "设置")
+                    .full_width()
+                    .when(self.page == Page::Preferences, |b| b.primary())
+                    .disabled(busy)
+                    .on_click(cx.listener(|h, _, _, cx| {
+                        h.page = Page::Preferences;
+                        cx.notify();
+                    })),
+            )
+            .child(
                 div()
                     .flex_none()
                     .border_t_1()
@@ -654,10 +742,11 @@ impl Home {
             ("screenshots", "截图", "game/screenshots"),
             ("schematics", "投影", "game/schematics"),
         ] {
-            files = files.child(
-                Button::new(id, label)
-                    .on_click(cx.listener(move |home, _, _, cx| home.open(path, cx))),
-            );
+            files = files.child(Button::new(id, label).on_click(cx.listener(
+                move |home, _, _, cx| {
+                    home.browse_files(label, path.strip_prefix("game/").unwrap_or(path), cx)
+                },
+            )));
         }
         files = files.child(Button::new("console", "实时控制台").on_click(cx.listener(
             |home, _, _, cx| {
@@ -702,6 +791,11 @@ impl Home {
                         .child(files)
                         .child(self.instance_actions(busy, cx))
                         .child(
+                            Button::new("content-tools", "组件与整合包")
+                                .disabled(busy)
+                                .on_click(cx.listener(|h, _, _, cx| h.open_content(cx))),
+                        )
+                        .child(
                             div()
                                 .flex()
                                 .flex_wrap()
@@ -721,6 +815,8 @@ impl Home {
                                             .on_click(cx.listener(|home, _, _, cx| {
                                                 home.page = Page::Mods;
                                                 home.hits.clear();
+                                                home.content.curse =
+                                                    crate::preferences::current().community == 1;
                                                 home.refresh_mods(cx);
                                             })),
                                     )
@@ -794,6 +890,11 @@ impl Home {
             .child(kicker(&self.instances[self.selected].name))
             .child(heading("实时控制台"))
             .child(tabs)
+            .child(
+                Button::new("export-crash", "导出脱敏诊断包")
+                    .disabled(self.copying)
+                    .on_click(cx.listener(|h, _, _, cx| h.export_report(cx))),
+            )
             .child(
                 div()
                     .flex()
@@ -932,7 +1033,37 @@ impl Home {
             .game_dir(&self.root)
             .and_then(|dir| mods::installed(&dir.join("mods")));
         match result {
-            Ok(jars) => self.jars = jars,
+            Ok(jars) => {
+                self.jars = jars;
+                self.mod_labels.clear();
+                let item = self.instances[self.selected].clone();
+                let root = self.root.clone();
+                let jars = self.jars.clone();
+                if crate::preferences::current().name_style == 0 {
+                    let id = item.id.clone();
+                    let task = cx.background_executor().spawn(async move {
+                        let dir = item.game_dir(&root).ok()?.join("mods");
+                        Some(
+                            jars.into_iter()
+                                .filter_map(|name| {
+                                    Some((name.clone(), mods::describe(&dir.join(name))?))
+                                })
+                                .collect(),
+                        )
+                    });
+                    cx.spawn(async move |view, cx| {
+                        if let Some(map) = task.await {
+                            let _ = view.update(cx, |h, cx| {
+                                if h.page == Page::Mods && h.instances[h.selected].id == id {
+                                    h.mod_labels = map;
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
+                    .detach();
+                }
+            }
             Err(e) => self.message(Err(e), cx),
         }
         cx.notify();
@@ -942,16 +1073,35 @@ impl Home {
         self.searching = true;
         self.hits.clear();
         self.failed = false;
-        self.status = "正在搜索 Modrinth".into();
+        let curse = self.content.curse;
+        self.status = "正在搜索模组".into();
         let item = self.instances[self.selected].clone();
+        let id = item.id.clone();
         let query = self.mod_query.read(cx).text().to_owned();
-        let task = cx
-            .background_executor()
-            .spawn(async move { mods::search(&item, &query) });
+        let task = cx.background_executor().spawn(async move {
+            if curse {
+                crate::curse::search_class(item.loader, &item.version, &query, 0, "6").map(|v| {
+                    v.into_iter()
+                        .map(|h| mods::Hit {
+                            project_id: format!("cf:{}", h.id),
+                            title: h.title,
+                        })
+                        .collect()
+                })
+            } else {
+                mods::search(&item, &query)
+            }
+        });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |home, cx| {
                 home.searching = false;
+                if home.page != Page::Mods
+                    || home.instances.get(home.selected).is_none_or(|i| i.id != id)
+                {
+                    cx.notify();
+                    return;
+                }
                 match result {
                     Ok(hits) => {
                         home.hits = hits;
@@ -982,6 +1132,52 @@ impl Home {
         self.listen(rx, cx);
     }
 
+    fn check_mod_updates(&mut self, cx: &mut Context<Self>) {
+        let item = self.instances[self.selected].clone();
+        let id = item.id.clone();
+        let root = self.root.clone();
+        let curse = self.content.curse;
+        self.searching = true;
+        self.content.upgrades.clear();
+        self.status = "校验本地模组并查询兼容版本".into();
+        let task = cx
+            .background_executor()
+            .spawn(async move { mods::upgrades(&root, &item, curse) });
+        cx.spawn(async move |view, cx| {
+            let r = task.await;
+            let _ = view.update(cx, |h, cx| {
+                h.searching = false;
+                if h.page == Page::Mods && h.instances[h.selected].id == id {
+                    match r {
+                        Ok(v) => {
+                            h.status = format!("{} 个模组有可用更新", v.len());
+                            h.content.upgrades = v;
+                            h.failed = false;
+                        }
+                        Err(e) => h.message(Err(e), cx),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+    fn apply_mod_update(&mut self, u: mods::Upgrade, cx: &mut Context<Self>) {
+        let item = self.instances[self.selected].clone();
+        let root = self.root.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
+        self.content.upgrades.clear();
+        let (tx, rx) = async_channel::unbounded();
+        std::thread::spawn(move || {
+            let result = mods::upgrade(&root, &item, &u, &cancel, |s| {
+                let _ = tx.try_send(Update::Status(s));
+            });
+            let _ = tx.try_send(Update::Finished(result, "模组更新完成"));
+        });
+        self.listen(rx, cx);
+    }
     fn mods_page(&self, cx: &Context<Self>) -> impl IntoElement {
         let item = &self.instances[self.selected];
         let busy = self.searching || self.cancel.is_some();
@@ -994,11 +1190,35 @@ impl Home {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(["Modrinth", "CurseForge"].into_iter().enumerate().map(
+                        |(i, name)| {
+                            Button::new(("mod-source", i), name)
+                                .when(self.content.curse == (i == 1), |b| b.primary())
+                                .disabled(busy)
+                                .on_click(cx.listener(move |h, _, _, cx| {
+                                    h.content.curse = i == 1;
+                                    h.hits.clear();
+                                    h.content.upgrades.clear();
+                                    cx.notify();
+                                }))
+                        },
+                    ))
+                    .child(
+                        Button::new("mod-updates", "检查已装模组更新")
+                            .disabled(busy)
+                            .on_click(cx.listener(|h, _, _, cx| h.check_mod_updates(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
                     .gap_2()
                     .items_center()
                     .child(div().flex_1().child(Input::new(&self.mod_query)))
                     .child(
-                        Button::new("mod-search", "搜索 Modrinth")
+                        Button::new("mod-search", "搜索")
                             .primary()
                             .disabled(busy)
                             .on_click(cx.listener(|home, _, _, cx| home.search_mods(cx))),
@@ -1032,6 +1252,14 @@ impl Home {
                         ),
                 );
         }
+        for (i, u) in self.content.upgrades.iter().enumerate() {
+            let u = u.clone();
+            page = page.child(
+                Button::new(("upgrade", i), format!("更新 {} → {}", u.old, u.new))
+                    .disabled(busy)
+                    .on_click(cx.listener(move |h, _, _, cx| h.apply_mod_update(u.clone(), cx))),
+            );
+        }
         page = page.child(kicker(&format!("已安装  /  {}", self.jars.len())));
         for (idx, name) in self.jars.iter().enumerate() {
             let name = name.clone();
@@ -1041,7 +1269,14 @@ impl Home {
                     .flex()
                     .gap_3()
                     .items_center()
-                    .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                    .child(
+                        div().flex_1().min_w_0().truncate().child(
+                            self.mod_labels
+                                .get(&name)
+                                .map(|s| format!("{s}  ·  {name}"))
+                                .unwrap_or_else(|| name.clone()),
+                        ),
+                    )
                     .child(
                         Button::new(("toggle-mod", idx), if disabled { "启用" } else { "停用" })
                             .disabled(busy)
@@ -1070,7 +1305,7 @@ impl Home {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("选择 Modrinth (.mrpack) 或 CurseForge (.zip) 整合包".into()),
+            prompt: Some("选择 Modrinth、CurseForge 或 MultiMC 整合包".into()),
         });
         cx.spawn(async move |view, cx| {
             let choice = picker.await;
@@ -1108,6 +1343,9 @@ impl Home {
         .into_iter()
         .enumerate()
         {
+            if loader == Loader::Quilt && crate::preferences::current().hide_quilt {
+                continue;
+            }
             loaders = loaders.child(
                 Button::new(("loader", idx), loader.label())
                     .when(loader == self.loader, |b| b.primary())
@@ -1228,6 +1466,9 @@ impl Drop for Home {
 
 impl Render for Home {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.prefs.minimize) {
+            window.minimize_window();
+        }
         if self.page != Page::Accounts {
             self.launch_after_login = None;
         }
@@ -1244,6 +1485,9 @@ impl Render for Home {
             window.request_animation_frame();
         }
         let page = match self.page {
+            Page::Preferences => self.preferences_page(cx).into_any_element(),
+            Page::Content => self.content_page(cx).into_any_element(),
+            Page::Files => self.files_page(cx).into_any_element(),
             Page::Library => self.manager_page(cx).into_any_element(),
             Page::Hub => self.hub_page(cx).into_any_element(),
             Page::Detail => self.detail(frame, cx).into_any_element(),
@@ -1326,6 +1570,19 @@ impl Render for Home {
                                             || self.hub.loading,
                                         |el| el.child(motion::task_progress(&self.status)),
                                     )
+                                    .when_some(self.prefs.link.clone(), |el, url: String| {
+                                        el.child(
+                                            Button::new("clipboard-link", "打开剪贴板中的社区资源")
+                                                .on_click(cx.listener(move |h, _, _, cx| {
+                                                    h.prefs.link = None;
+                                                    h.message(
+                                                        open::that_detached(&url)
+                                                            .map_err(Into::into),
+                                                        cx,
+                                                    );
+                                                })),
+                                        )
+                                    })
                                     .child(self.status.clone()),
                             ),
                     ),

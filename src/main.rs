@@ -3,6 +3,7 @@
 mod accounts;
 mod avatar;
 mod backups;
+mod content;
 mod curse;
 mod download;
 mod folders;
@@ -15,6 +16,7 @@ mod market;
 mod memory;
 mod mods;
 mod packs;
+mod preferences;
 mod third_party;
 mod ui;
 
@@ -33,7 +35,7 @@ fn main() {
         .with_assets(Assets)
         .run(|cx: &mut App| {
             ely_gpui_component::init(cx).expect("Ely 初始化失败");
-            ui::apply_palette(cx);
+
             let bounds = Bounds::centered(None, size(px(930.), px(600.)), cx);
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
@@ -46,12 +48,14 @@ fn main() {
                 ..Default::default()
             };
             let library = library::data_root().and_then(|root| {
+                preferences::Prefs::init(&root)?;
                 Ok((
                     library::load(&root)?,
                     accounts::Accounts::read(&root)?,
                     root,
                 ))
             });
+            ui::apply_palette(cx);
             match library {
                 Ok((items, accounts, root)) => {
                     cx.open_window(options, |window, cx| {

@@ -8,21 +8,39 @@ use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::{Client, RequestBuilder};
 use serde::{Deserialize, de::DeserializeOwned};
 use std::collections::HashMap;
-const API: &str = "https://api.curseforge.com/v1";
+const OFFICIAL: &str = "https://api.curseforge.com/v1";
+fn endpoint() -> Result<String> {
+    let value = crate::setting("CURSEFORGE_SERVICE")
+        .and_then(|v| v.into_string().ok())
+        .or_else(|| option_env!("NOCTILUCA_CURSEFORGE_SERVICE").map(str::to_owned))
+        .unwrap_or_else(|| OFFICIAL.into());
+    let url = url::Url::parse(&value)?;
+    ensure!(
+        url.scheme() == "https"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "CurseForge 服务地址无效"
+    );
+    Ok(value.trim_end_matches('/').to_owned())
+}
 
-fn api() -> Result<(Client, reqwest::header::HeaderValue)> {
-    let key = crate::setting("CURSEFORGE_API_KEY").and_then(|k|k.into_string().ok())
-        .filter(|k| !k.trim().is_empty())
-        .context(
-            "使用 CurseForge 需要设置 NOCTILUCA_CURSEFORGE_API_KEY，可在 CurseForge for Studios 申请",
-        )?;
-    let mut key = reqwest::header::HeaderValue::from_str(key.trim())?;
-    key.set_sensitive(true);
+fn api() -> Result<(Client, String)> {
+    let url = endpoint()?;
+    let mut headers = reqwest::header::HeaderMap::new();
+    if url == OFFICIAL {
+        let key=crate::setting("CURSEFORGE_API_KEY").and_then(|v|v.into_string().ok()).filter(|v|!v.trim().is_empty()).context("此发行版尚未连接 Noctiluca 的 CurseForge 服务。可使用 Modrinth 或导入已安装的游戏目录。")?;
+        let mut value = reqwest::header::HeaderValue::from_str(key.trim())?;
+        value.set_sensitive(true);
+        headers.insert("x-api-key", value);
+    }
     Ok((
         download::client_builder()
+            .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
-        key,
+        url,
     ))
 }
 #[derive(Deserialize)]
@@ -41,6 +59,7 @@ fn loader_id(loader: Loader) -> Result<&'static str> {
         Loader::NeoForge => Ok("6"),
         Loader::Forge => Ok("1"),
         Loader::Fabric => Ok("4"),
+        Loader::Quilt => Ok("5"),
         _ => bail!("无效的 CurseForge 加载器"),
     }
 }
@@ -62,6 +81,14 @@ struct File {
     file_name: String,
     download_url: Option<String>,
     hashes: Vec<Hash>,
+    #[serde(default)]
+    dependencies: Vec<Dep>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Dep {
+    mod_id: u64,
+    relation_type: u32,
 }
 #[derive(Deserialize)]
 struct Hash {
@@ -91,20 +118,26 @@ impl File {
     }
 }
 pub fn search(loader: Loader, mc: &str, query: &str, offset: usize) -> Result<Vec<Hit>> {
-    let (http, key) = api()?;
-    let mut request = http
-        .get(format!("{API}/mods/search"))
-        .header("x-api-key", key)
-        .query(&[
-            ("gameId", "432"),
-            ("classId", "4471"),
-            ("modLoaderType", loader_id(loader)?),
-            ("searchFilter", query),
-            ("pageSize", "10"),
-            ("index", &offset.to_string()),
-            ("sortField", "6"),
-            ("sortOrder", "desc"),
-        ]);
+    search_class(loader, mc, query, offset, "4471")
+}
+pub fn search_class(
+    loader: Loader,
+    mc: &str,
+    query: &str,
+    offset: usize,
+    class: &str,
+) -> Result<Vec<Hit>> {
+    let (http, api) = api()?;
+    let mut request = http.get(format!("{api}/mods/search")).query(&[
+        ("gameId", "432"),
+        ("classId", class),
+        ("modLoaderType", loader_id(loader)?),
+        ("searchFilter", query),
+        ("pageSize", "10"),
+        ("index", &offset.to_string()),
+        ("sortField", "6"),
+        ("sortOrder", "desc"),
+    ]);
     if !mc.is_empty() {
         request = request.query(&[("gameVersion", mc)]);
     }
@@ -119,19 +152,16 @@ pub fn search(loader: Loader, mc: &str, query: &str, offset: usize) -> Result<Ve
         .collect())
 }
 pub fn releases(loader: Loader, mc: &str, id: &str) -> Result<Vec<Release>> {
-    let (http, key) = api()?;
+    let (http, api) = api()?;
     let id = id.parse::<u64>()?;
     let mut releases = vec![];
     let mut index = 0;
     loop {
-        let mut request = http
-            .get(format!("{API}/mods/{id}/files"))
-            .header("x-api-key", &key)
-            .query(&[
-                ("modLoaderType", loader_id(loader)?),
-                ("pageSize", "50"),
-                ("index", &index.to_string()),
-            ]);
+        let mut request = http.get(format!("{api}/mods/{id}/files")).query(&[
+            ("modLoaderType", loader_id(loader)?),
+            ("pageSize", "50"),
+            ("index", &index.to_string()),
+        ]);
         if !mc.is_empty() {
             request = request.query(&[("gameVersion", mc)]);
         }
@@ -140,6 +170,8 @@ pub fn releases(loader: Loader, mc: &str, id: &str) -> Result<Vec<Release>> {
         for f in files {
             if f.file_name.to_ascii_lowercase().ends_with(".zip") && f.url().is_ok() {
                 releases.push(Release {
+                    source: crate::market::Source::CurseForge,
+                    project: id.to_string(),
                     id: f.id.to_string(),
                     name: f.display_name.clone(),
                     url: f.url()?,
@@ -175,18 +207,16 @@ pub(super) fn resolve(requirements: &[Requirement], required: bool) -> Result<Ve
     if requirements.is_empty() {
         return Ok(vec![]);
     }
-    let (http, key) = api()?;
+    let (http, api) = api()?;
     let mut resolved = vec![];
     for chunk in requirements.chunks(50) {
         let ids: Vec<_> = chunk.iter().map(|r| r.file).collect();
         let projects: Vec<_> = chunk.iter().map(|r| r.project).collect();
         let files: Vec<File> = get(http
-            .post(format!("{API}/mods/files"))
-            .header("x-api-key", &key)
+            .post(format!("{api}/mods/files"))
             .json(&serde_json::json!({"fileIds":ids})))?;
         let mods: Vec<Project> = get(http
-            .post(format!("{API}/mods"))
-            .header("x-api-key", &key)
+            .post(format!("{api}/mods"))
             .json(&serde_json::json!({"modIds":projects})))?;
         for r in chunk {
             let file = files
@@ -230,4 +260,84 @@ pub(super) fn resolve(requirements: &[Requirement], required: bool) -> Result<Ve
         }
     }
     Ok(resolved)
+}
+
+pub struct Jar {
+    pub project: u64,
+    pub id: u64,
+    pub name: String,
+    pub hash: String,
+    pub url: String,
+    pub required: Vec<u64>,
+}
+pub fn latest_jar(project: u64, loader: Loader, mc: &str) -> Result<Jar> {
+    let (http, api) = api()?;
+    let files: Vec<File> = get(http.get(format!("{api}/mods/{project}/files")).query(&[
+        ("gameVersion", mc),
+        ("modLoaderType", loader_id(loader)?),
+        ("pageSize", "50"),
+    ]))?;
+    let f = files
+        .into_iter()
+        .find(|f| f.mod_id == project && f.file_name.to_ascii_lowercase().ends_with(".jar"))
+        .context("没有兼容的 CurseForge 模组版本")?;
+    Ok(Jar {
+        project,
+        id: f.id,
+        hash: f.sha1()?,
+        url: f.url()?,
+        name: f.file_name,
+        required: f
+            .dependencies
+            .into_iter()
+            .filter(|d| d.relation_type == 3)
+            .map(|d| d.mod_id)
+            .collect(),
+    })
+}
+
+pub fn fingerprint(bytes: &[u8]) -> u32 {
+    const M: u32 = 0x5bd1e995;
+    let data: Vec<_> = bytes
+        .iter()
+        .copied()
+        .filter(|b| !matches!(b, 9 | 10 | 13 | 32))
+        .collect();
+    let mut h = 1 ^ (data.len() as u32);
+    let (chunks, tail) = data.as_chunks::<4>();
+    for c in chunks {
+        let k = u32::from_le_bytes(*c).wrapping_mul(M);
+        h = h.wrapping_mul(M) ^ ((k ^ (k >> 24)).wrapping_mul(M));
+    }
+    if !tail.is_empty() {
+        for (i, c) in tail.iter().enumerate() {
+            h ^= (*c as u32) << (8 * i);
+        }
+        h = h.wrapping_mul(M);
+    }
+    h ^= h >> 13;
+    h = h.wrapping_mul(M);
+    h ^ (h >> 15)
+}
+pub fn match_jars(values: &[u32]) -> Result<HashMap<String, (u64, u64)>> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Matches {
+        exact_matches: Vec<Matched>,
+    }
+    #[derive(Deserialize)]
+    struct Matched {
+        file: File,
+    }
+    let (http, api) = api()?;
+    let mut result = HashMap::new();
+    for batch in values.chunks(100) {
+        let matches: Matches = get(http
+            .post(format!("{api}/fingerprints/432"))
+            .json(&serde_json::json!({"fingerprints":batch})))?;
+        for m in matches.exact_matches {
+            result.insert(m.file.sha1()?, (m.file.mod_id, m.file.id));
+        }
+    }
+    Ok(result)
 }

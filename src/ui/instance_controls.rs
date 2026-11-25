@@ -2,7 +2,7 @@ use super::*;
 use crate::memory::{self, Global, Mode};
 use ely_gpui_component::forms::Slider;
 pub(super) struct Controls {
-    global: Global,
+    pub(super) global: Global,
     editing_global: bool,
     confirm: Option<String>,
     removed: Option<Vec<Instance>>,

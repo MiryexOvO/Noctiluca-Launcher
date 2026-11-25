@@ -70,7 +70,15 @@ pub fn install(
     {
         return Ok(profile);
     }
-    let java = java::select(shared, base, downloads, instance.java_path.as_deref())?;
+    let java = java::select(
+        shared,
+        base,
+        downloads,
+        instance
+            .java_path
+            .as_deref()
+            .or(crate::preferences::current().java.as_deref()),
+    )?;
     downloads.batch(
         shared,
         "准备加载器基础文件",

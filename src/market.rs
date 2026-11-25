@@ -10,7 +10,7 @@ use mc_launcher_core::{
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, Deserialize)]
 pub enum Source {
     Modrinth,
     CurseForge,
@@ -31,6 +31,8 @@ pub struct Hit {
 }
 #[derive(Clone)]
 pub struct Release {
+    pub source: Source,
+    pub project: String,
     pub name: String,
     pub id: String,
     pub url: String,
@@ -65,7 +67,8 @@ fn slug(loader: Loader) -> Result<&'static str> {
         Loader::NeoForge => Ok("neoforge"),
         Loader::Forge => Ok("forge"),
         Loader::Fabric => Ok("fabric"),
-        _ => bail!("请选择支持的加载器"),
+        Loader::Quilt => Ok("quilt"),
+        Loader::Vanilla => Ok("minecraft"),
     }
 }
 #[derive(Deserialize)]
@@ -158,6 +161,8 @@ pub fn releases(source: Source, loader: Loader, mc: &str, project: &str) -> Resu
                 .filter(|f| f.filename.ends_with(".mrpack"))
                 .max_by_key(|f| f.primary)?;
             Some(Release {
+                source,
+                project: project.into(),
                 id: v.id,
                 name: format!("{} · {}", v.name, v.version_number),
                 url: file.url,
@@ -196,6 +201,10 @@ pub fn builds(loader: Loader, mc: &str) -> Result<Vec<String>> {
                 .json()?;
             list.into_iter().map(|v| v.loader.version).collect()
         }
+        Loader::Quilt => mc_launcher_core::loader::quilt::list_loader_versions()?
+            .into_iter()
+            .map(|v| v.version)
+            .collect(),
         _ => bail!("请选择支持的加载器"),
     };
     ids.retain(|v| safe_id(v));
@@ -214,4 +223,116 @@ pub fn builds(loader: Loader, mc: &str) -> Result<Vec<String>> {
     ids.reverse();
     ids.dedup();
     Ok(ids)
+}
+
+pub fn lookup_pack_hash(hash: &str) -> Result<crate::content::Upstream> {
+    ensure!(
+        hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+        "归档校验值无效"
+    );
+    #[derive(Deserialize)]
+    struct Match {
+        project_id: String,
+        id: String,
+    }
+    let resp = download::client()?
+        .get(format!("https://api.modrinth.com/v2/version_file/{hash}"))
+        .query(&[("algorithm", "sha1")])
+        .send()?;
+    ensure!(
+        resp.status() != reqwest::StatusCode::NOT_FOUND,
+        "这个本地包没有对应的 Modrinth 发布版本，请选择本地新版包"
+    );
+    let v: Match = resp.error_for_status()?.json()?;
+    Ok(crate::content::Upstream {
+        source: Source::Modrinth,
+        project: v.project_id,
+        release: v.id,
+    })
+}
+fn resource_type(kind: &str) -> Result<&str> {
+    match kind {
+        "resourcepacks" => Ok("resourcepack"),
+        "shaderpacks" => Ok("shader"),
+        _ => bail!("不支持此资源类型"),
+    }
+}
+pub fn resources(kind: &str, mc: &str, q: &str) -> Result<Vec<Hit>> {
+    let filters = serde_json::json!([
+        [format!("project_type:{}", resource_type(kind)?)],
+        [format!("versions:{mc}")]
+    ])
+    .to_string();
+    let v: Search = download::client()?
+        .get("https://api.modrinth.com/v2/search")
+        .query(&[("query", q), ("facets", &filters), ("limit", "10")])
+        .send()?
+        .error_for_status()?
+        .json()?;
+    Ok(v.hits
+        .into_iter()
+        .map(|p| Hit {
+            id: p.project_id,
+            title: p.title,
+            description: p.description,
+        })
+        .collect())
+}
+pub fn install_resource(
+    root: &Path,
+    item: &crate::library::Instance,
+    kind: &str,
+    id: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    report: impl Fn(String) + Sync,
+) -> Result<()> {
+    resource_type(kind)?;
+    ensure!(safe_id(id), "项目 ID 无效");
+    let _lock = crate::library::lock_instance(root, item, "请退出游戏后安装资源")?;
+    let dir = crate::content::resource_dir(root, item, kind)?;
+    let d = Downloads::new(cancel, &report)?;
+    let versions: Vec<Version> = d
+        .http
+        .get(format!("https://api.modrinth.com/v2/project/{id}/version"))
+        .query(&[(
+            "game_versions",
+            serde_json::json!([item.version]).to_string(),
+        )])
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let file = versions
+        .into_iter()
+        .find_map(|v| {
+            v.files
+                .into_iter()
+                .filter(|f| f.filename.to_ascii_lowercase().ends_with(".zip"))
+                .max_by_key(|f| f.primary)
+        })
+        .ok_or_else(|| anyhow::anyhow!("没有兼容的 ZIP 资源"))?;
+    let name = crate::packs::relative(&file.filename)?;
+    ensure!(name.components().count() == 1, "文件名无效");
+    let url = url::Url::parse(&file.url)?;
+    ensure!(
+        url.scheme() == "https" && url.host_str() == Some("cdn.modrinth.com"),
+        "资源下载地址无效"
+    );
+    let dest = dir.join(name);
+    if dest.exists() {
+        ensure!(
+            mc_launcher_core::io::hash::sha1_file(&dest)? == file.hashes.sha1,
+            "同名文件已经存在"
+        );
+        return Ok(());
+    }
+    d.batch(
+        &dir,
+        "安装资源",
+        vec![DownloadTask {
+            url: file.url,
+            label: file.filename,
+            destination: dest,
+            checksum: Some(Checksum::Sha1(file.hashes.sha1)),
+        }],
+    )
 }

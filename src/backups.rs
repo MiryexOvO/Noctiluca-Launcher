@@ -85,7 +85,7 @@ fn snapshot(
             }
         }
     } else {
-        for part in ["game", "loader.json"] {
+        for part in ["game", "loader.json", "pack-state.json"] {
             let src = source.join(part);
             if src.try_exists()? {
                 copy_tree(&src, &temp.path().join(part))?;

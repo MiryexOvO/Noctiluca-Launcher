@@ -78,9 +78,92 @@ fn read_index(zip: &mut ZipArchive<File>) -> Result<Manifest> {
             curse: None,
         });
     }
+    let mmc = zip
+        .file_names()
+        .find(|n| *n == "mmc-pack.json" || n.ends_with("/mmc-pack.json"))
+        .map(str::to_owned);
+    if let Some(name) = mmc {
+        let prefix = name.strip_suffix("mmc-pack.json").unwrap();
+        if !prefix.is_empty() {
+            relative(prefix.trim_end_matches('/'))?;
+        }
+        ensure!(
+            !zip.file_names()
+                .any(|n| n != name && (n == "mmc-pack.json" || n.ends_with("/mmc-pack.json"))),
+            "压缩包包含多个实例"
+        );
+        let entry = zip.by_name(&name)?;
+        ensure!(entry.size() <= 1024 * 1024, "MultiMC 清单过大");
+        let manifest: serde_json::Value = serde_json::from_reader(entry)?;
+        ensure!(manifest["formatVersion"] == 1, "未知 MultiMC 格式");
+        let mut deps = HashMap::new();
+        for c in manifest["components"]
+            .as_array()
+            .context("缺少 MultiMC 组件")?
+        {
+            let uid = c["uid"].as_str().context("缺少组件 ID")?;
+            let k = match uid {
+                "net.minecraft" => "minecraft",
+                "net.minecraftforge" => "forge",
+                "net.neoforged" => "neoforge",
+                "net.fabricmc.fabric-loader" => "fabric-loader",
+                "org.quiltmc.quilt-loader" => "quilt-loader",
+                "org.lwjgl" | "org.lwjgl3" | "net.fabricmc.intermediary" | "org.quiltmc.hashed" => {
+                    continue;
+                }
+                _ => bail!("暂不支持 MultiMC 组件 {uid}"),
+            };
+            ensure!(
+                deps.insert(
+                    k.into(),
+                    c["version"].as_str().context("缺少组件版本")?.to_owned()
+                )
+                .is_none(),
+                "重复的 MultiMC 组件"
+            );
+        }
+        ensure!(
+            !zip.file_names()
+                .any(|n| n.starts_with(&format!("{prefix}patches/")) && n.ends_with(".json")),
+            "此实例包含自定义组件补丁"
+        );
+        let mut title = prefix
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_owned();
+        if let Ok(cfg) = zip.by_name(&format!("{prefix}instance.cfg")) {
+            let mut txt = String::new();
+            cfg.take(256 * 1024).read_to_string(&mut txt)?;
+            if let Some(v) = txt.lines().find_map(|l| l.strip_prefix("name=")) {
+                title = v.trim().to_owned();
+            }
+        }
+        if title.is_empty() {
+            title = "MultiMC 实例".into();
+        }
+        let folders = [".minecraft/", "minecraft/"].map(|v| format!("{prefix}{v}"));
+        let prefixes = folders
+            .into_iter()
+            .filter(|p| zip.file_names().any(|n| n.starts_with(p)))
+            .collect::<Vec<_>>();
+        ensure!(prefixes.len() <= 1, "MultiMC 实例包含两个游戏目录");
+        return Ok(Manifest {
+            index: Index {
+                format_version: 1,
+                game: "minecraft".into(),
+                name: title,
+                dependencies: deps,
+                files: vec![],
+            },
+            prefixes,
+            curse: None,
+        });
+    }
     let manifest = zip
         .by_name("manifest.json")
-        .context("未找到 Modrinth 或 CurseForge 整合包清单")?;
+        .context("未找到 Modrinth、CurseForge 或 MultiMC 清单")?;
     ensure!(manifest.size() <= 16 * 1024 * 1024, "整合包清单过大");
     let m: CurseManifest = serde_json::from_reader(manifest)?;
     ensure!(
@@ -125,7 +208,7 @@ fn read_index(zip: &mut ZipArchive<File>) -> Result<Manifest> {
     })
 }
 
-fn relative(name: &str) -> Result<PathBuf> {
+pub(crate) fn relative(name: &str) -> Result<PathBuf> {
     let mut path = PathBuf::new();
     for part in name.split('/') {
         let stem = part
@@ -171,6 +254,10 @@ pub struct Preview {
     pub instance: Instance,
     pub files: Vec<PackFile>,
     pub curse: bool,
+    pub archive_sha1: Option<String>,
+    pub format: &'static str,
+    pub upstream: Option<crate::content::Upstream>,
+    pub target: Option<Instance>,
     pub metadata_error: Option<String>,
     pub optional_error: Option<String>,
     pub required_count: usize,
@@ -215,6 +302,10 @@ impl PackFile {
 pub fn preview(root: &Path, path: &Path) -> Result<Preview> {
     let mut zip = ZipArchive::new(File::open(path).context("无法打开所选整合包")?)
         .context("无法读取整合包压缩文件")?;
+    let multi = zip
+        .file_names()
+        .any(|n| n == "mmc-pack.json" || n.ends_with("/mmc-pack.json"))
+        && zip.index_for_name("modrinth.index.json").is_none();
     let Manifest {
         mut index,
         prefixes,
@@ -296,6 +387,20 @@ pub fn preview(root: &Path, path: &Path) -> Result<Preview> {
         instance,
         files,
         curse: curse.is_some(),
+        archive_sha1: if !multi && curse.is_none() {
+            Some(mc_launcher_core::io::hash::sha1_file(path)?)
+        } else {
+            None
+        },
+        format: if multi {
+            "MultiMC"
+        } else if curse.is_some() {
+            "CurseForge"
+        } else {
+            "Modrinth"
+        },
+        upstream: None,
+        target: None,
         metadata_error,
         optional_error,
         required_count,
@@ -362,6 +467,17 @@ impl Preview {
         optional: &HashSet<usize>,
         cancel: &AtomicBool,
         report: impl Fn(String) + Sync,
+    ) -> Result<Instance> {
+        self.install_prepared(root, optional, cancel, report, None)
+    }
+
+    pub fn install_prepared(
+        &self,
+        root: &Path,
+        optional: &HashSet<usize>,
+        cancel: &AtomicBool,
+        report: impl Fn(String) + Sync,
+        pin: Option<&[u8]>,
     ) -> Result<Instance> {
         if let Some(error) = &self.metadata_error {
             bail!("{error}");
@@ -435,6 +551,19 @@ impl Preview {
             }
         }
         downloads.check()?;
+        let mut state =
+            crate::content::PackState::from_game(&game, self.upstream.clone(), &instance.name)?;
+        state.archive_sha1 = self.archive_sha1.clone();
+        crate::library::atomic_write(
+            &temp.path().join("pack-state.json"),
+            &serde_json::to_vec(&state)?,
+        )?;
+        if let Some(pin) = pin {
+            fs::write(temp.path().join("loader.json"), pin)?;
+        }
+        if let Some(target) = &self.target {
+            return crate::content::apply_pack(root, target, instance, temp.path(), &state, cancel);
+        }
         fs::write(
             temp.path().join("instance.json"),
             serde_json::to_vec_pretty(instance)?,

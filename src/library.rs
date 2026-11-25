@@ -214,6 +214,7 @@ pub fn lock_instance(
     } else {
         None
     };
+    crate::mods::recover(&item.game_dir(root)?)?;
     Ok((local, game))
 }
 
@@ -275,6 +276,7 @@ pub fn load(root: &Path) -> Result<Vec<Instance>> {
         .truncate(false)
         .open(root.join("library.lock"))?;
     lock.lock()?;
+    crate::content::recover(root)?;
     let instances = root.join("instances");
     fs::create_dir_all(&instances)?;
     let mut result = Vec::new();

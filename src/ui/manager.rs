@@ -124,6 +124,8 @@ impl Home {
     }
     pub(super) fn show_instance(&mut self, index: usize, cx: &mut Context<Self>) {
         self.controls.reset_selection();
+        self.content.upgrades.clear();
+        self.hits.clear();
         self.selected = index;
         self.page = Page::Detail;
         (self.failed, self.status) = self

@@ -32,7 +32,7 @@ gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = 
 ely-gpui-component = { git = "https://github.com/ZacharyZhang-NY/Ely-GPUI-Components", rev = "5d6efd46ec0c93b381ec7578561a1273c366025b" }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging","Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging","Win32_UI_Shell","Win32_Foundation","Win32_System_SystemInformation"] }
 
 [build-dependencies]
 embed-resource = "3.0"
