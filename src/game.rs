@@ -160,7 +160,8 @@ pub fn play(
     report: impl Fn(String) + Sync,
 ) -> Result<()> {
     let dir = instance.path(root);
-    let instance_lock = crate::library::lock_instance(root, &dir, "这个实例正在另一窗口中使用")?;
+    let instance_lock =
+        crate::library::lock_instance(root, instance, "这个实例正在另一窗口中使用")?;
     let mut journal = File::create(dir.join("launcher.log"))?;
     let result = prepare_and_play(
         root,
@@ -198,10 +199,18 @@ fn prepare_and_play(
     report: &(dyn Fn(String) + Sync),
     journal: &mut File,
 ) -> Result<()> {
-    let shared = root.join("shared");
+    let game_dir = instance.game_dir(root)?;
+    let shared = instance
+        .external
+        .as_ref()
+        .map_or_else(|| root.join("shared"), |link| link.origin.folder.clone());
     fs::create_dir_all(&shared)?;
     let install_lock = lock_file(
-        &shared.join("install.lock"),
+        &shared.join(if instance.external.is_some() {
+            ".noctiluca-install.lock"
+        } else {
+            "install.lock"
+        }),
         "另一个窗口正在安装游戏，请稍后重试",
     )?;
     let mut downloads = Downloads::new(cancel, report)?;
@@ -211,7 +220,7 @@ fn prepare_and_play(
         .map(|o| o.folder.clone())
         .or(crate::library::cache_source(root)?);
     let dir = instance.path(root);
-    let game_dir = dir.join("game");
+
     fs::create_dir_all(game_dir.join("mods"))?;
     report("读取游戏版本信息".into());
     writeln!(
@@ -221,13 +230,23 @@ fn prepare_and_play(
         instance.version,
         instance.loader.label()
     )?;
-    let version = version(root, &shared, instance, &downloads).context("读取版本信息失败")?;
-    let java = java::select(&shared, &version, &downloads, instance.java_path.as_deref())?;
-    downloads.batch(
-        &shared,
-        "游戏与运行库",
-        vanilla::plan_vanilla_downloads(&version, &shared)?.tasks,
+    let version = match &instance.external {
+        Some(link) => link.version(),
+        None => version(root, &shared, instance, &downloads),
+    }
+    .context("读取版本信息失败")?;
+    let java = java::select(
+        &root.join("shared"),
+        &version,
+        &downloads,
+        instance.java_path.as_deref(),
     )?;
+    let mut files = vanilla::plan_vanilla_downloads(&version, &shared)?.tasks;
+    if instance.external.is_some() && !install_only {
+        // Existing launchers may use a locally patched client or libraries.
+        files.retain(|task| !task.destination.is_file());
+    }
+    downloads.batch(&shared, "游戏与运行库", files)?;
     if let Some(index) = &version.asset_index {
         let path = assets::asset_index_path(&shared, &index.id);
         let objects = serde_json::from_slice(&fs::read(path)?)?;

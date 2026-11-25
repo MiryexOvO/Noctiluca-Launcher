@@ -50,12 +50,15 @@ impl Home {
         let root = self.root.clone();
         self.manager.scanning = true;
         let task = cx.background_executor().spawn(async move {
-            let folder = if register {
+            let (folder, only) = if register {
                 folders::register(&root, &folder)?
             } else {
-                folder
+                (folder, None)
             };
-            let found = folders::scan(&folder)?;
+            let mut found = folders::scan(&folder)?;
+            if let Some(profile) = only {
+                found.retain(|p| p.origin.profile == profile);
+            }
             Ok::<_, anyhow::Error>((folder, found))
         });
         cx.spawn(async move |view, cx| {
@@ -84,7 +87,7 @@ impl Home {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("选择已有的 .minecraft 目录".into()),
+            prompt: Some("选择 .minecraft、它的上级目录或单个版本目录".into()),
         });
         cx.spawn(async move |view, cx| {
             let result = picker.await;
@@ -100,34 +103,24 @@ impl Home {
         })
         .detach();
     }
-    fn bring_instance(&mut self, found: Found, cx: &mut Context<Self>) {
-        if self.copying || self.cancel.is_some() {
+    fn launch_existing(&mut self, found: &Found, cx: &mut Context<Self>) {
+        if self.cancel.is_some() || self.copying || self.logging_in {
             return;
         }
-        let root = self.root.clone();
-        self.copying = true;
-        self.failed = false;
-        self.status = "正在复制实例的游戏文件".into();
-        let task = cx
-            .background_executor()
-            .spawn(async move { folders::import(&root, &found) });
-        cx.spawn(async move |view, cx| {
-            let result = task.await;
-            let _ = view.update(cx, |home, cx| {
-                home.copying = false;
-                match result {
-                    Ok(item) => {
-                        home.instances.push(item);
-                        home.show_instance(home.instances.len() - 1, cx);
-                        home.status = "已复制到实例库".into();
-                    }
-                    Err(e) => home.message(Err(e), cx),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
+        match folders::link(&self.root, found) {
+            Ok(item) => {
+                let index = if let Some(i) = self.instances.iter().position(|i| i.id == item.id) {
+                    self.instances[i] = item;
+                    i
+                } else {
+                    self.instances.push(item);
+                    self.instances.len() - 1
+                };
+                self.show_instance(index, cx);
+                self.play(false, cx);
+            }
+            Err(err) => self.message(Err(err), cx),
+        }
     }
     pub(super) fn show_instance(&mut self, index: usize, cx: &mut Context<Self>) {
         self.controls.reset_selection();
@@ -247,18 +240,18 @@ impl Home {
                     .child(
                         Button::new(
                             (loader.label(), key),
-                            if index.is_some() {
-                                "打开实例"
+                            if found.is_some() {
+                                "启动游戏"
                             } else {
-                                "复制到实例库"
+                                "打开实例"
                             },
                         )
                         .disabled(busy)
                         .on_click(cx.listener(move |home, _, _, cx| {
-                            if let Some(i) = index {
+                            if let Some(f) = &found {
+                                home.launch_existing(f, cx);
+                            } else if let Some(i) = index {
                                 home.show_instance(i, cx);
-                            } else if let Some(f) = found.clone() {
-                                home.bring_instance(f, cx);
                             }
                         })),
                     )
@@ -272,7 +265,14 @@ impl Home {
                         .running
                         .get(&item.id)
                         .map(|pid| format!("运行中 · PID {pid}"))
-                        .unwrap_or_else(|| "独立实例".into());
+                        .unwrap_or_else(|| {
+                            if item.external.is_some() {
+                                "原目录实例"
+                            } else {
+                                "独立实例"
+                            }
+                            .into()
+                        });
                     rows = rows.child(row(
                         &item.name,
                         &item.version,
@@ -287,10 +287,6 @@ impl Home {
                     f.loader == loader
                         && matches(&f.origin.profile, &f.version, loader, f.build.as_deref())
                 }) {
-                    let index = self
-                        .instances
-                        .iter()
-                        .position(|i| i.origin.as_ref() == Some(&f.origin));
                     rows = rows.child(row(
                         &f.origin.profile,
                         &f.version,
@@ -300,7 +296,7 @@ impl Home {
                         } else {
                             "共用游戏目录"
                         },
-                        index,
+                        None,
                         Some(f.clone()),
                     ));
                 }

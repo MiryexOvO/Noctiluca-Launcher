@@ -40,6 +40,8 @@ pub struct Instance {
     pub loader_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<Origin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<crate::folders::External>,
     pub memory_mib: u32,
     #[serde(default)]
     pub memory_mode: crate::memory::Mode,
@@ -110,6 +112,7 @@ impl Instance {
             loader,
             loader_version: None,
             origin: None,
+            external: None,
             memory_mib: 2048,
             memory_mode: crate::memory::Mode::Global,
             initial_mib: 512,
@@ -117,6 +120,13 @@ impl Instance {
             jvm_args: Vec::new(),
             resolution: None,
         })
+    }
+
+    pub fn game_dir(&self, root: &Path) -> Result<PathBuf> {
+        match &self.external {
+            Some(link) => link.game_dir(),
+            None => Ok(self.path(root).join("game")),
+        }
     }
 
     pub fn path(&self, root: &Path) -> PathBuf {
@@ -184,13 +194,27 @@ pub fn cache_source(root: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
-pub fn lock_instance(root: &Path, dir: &Path, reason: &str) -> Result<fs::File> {
+pub fn lock_instance(
+    root: &Path,
+    item: &Instance,
+    reason: &str,
+) -> Result<(fs::File, Option<fs::File>)> {
+    let dir = item.path(root);
     let _library = crate::game::lock_file(&root.join("library.lock"), "其他窗口正在修改实例库")?;
     ensure!(
         dir.join("instance.json").is_file(),
         "实例已移除，请重新打开实例库"
     );
-    crate::game::lock_file(&dir.join("game.lock"), reason)
+    let local = crate::game::lock_file(&dir.join("game.lock"), reason)?;
+    let game = if let Some(link) = &item.external {
+        Some(crate::game::lock_file(
+            &link.game_dir()?.join(".noctiluca-game.lock"),
+            "另一个操作正在使用同一游戏目录",
+        )?)
+    } else {
+        None
+    };
+    Ok((local, game))
 }
 
 pub fn move_instance(root: &Path, id: &str, restore: bool) -> Result<()> {

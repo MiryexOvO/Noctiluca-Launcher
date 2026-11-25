@@ -216,13 +216,18 @@ impl Home {
         card
     }
     pub(super) fn instance_actions(&self, busy: bool, cx: &Context<Self>) -> Div {
+        let linked = self.instances[self.selected].external.is_some();
         let id = self.instances[self.selected].id.clone();
         if self.controls.confirm.as_ref() == Some(&id) {
             return panel(&format!(
                 "将「{}」移入已删除实例？",
                 self.instances[self.selected].name
             ))
-            .child(kicker("存档和模组会一起保留，可在实例管理中恢复。"))
+            .child(kicker(if linked {
+                "移除启动器中的关联，原目录保留。"
+            } else {
+                "存档和模组会一起保留，可在实例管理中恢复。"
+            }))
             .child(
                 div()
                     .flex()
@@ -251,12 +256,19 @@ impl Home {
                     .on_click(cx.listener(|h, _, _, cx| h.open_settings(cx))),
             )
             .child(
-                Button::new("delete-instance", "删除实例")
-                    .disabled(busy)
-                    .on_click(cx.listener(move |h, _, _, cx| {
-                        h.controls.confirm = Some(id.clone());
-                        cx.notify();
-                    })),
+                Button::new(
+                    "delete-instance",
+                    if linked {
+                        "移除关联"
+                    } else {
+                        "删除实例"
+                    },
+                )
+                .disabled(busy)
+                .on_click(cx.listener(move |h, _, _, cx| {
+                    h.controls.confirm = Some(id.clone());
+                    cx.notify();
+                })),
             )
     }
     fn move_instance(&mut self, id: &str, restore: bool, cx: &mut Context<Self>) {

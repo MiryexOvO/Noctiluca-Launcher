@@ -4004,6 +4004,7 @@ dependencies = [
  "async-channel",
  "base64 0.22.1",
  "chrono",
+ "dunce",
  "ely-gpui-component",
  "gpui-pre",
  "gpui-pre-platform",

@@ -313,14 +313,26 @@ fn minecraft_session(tokens: AuthorizationTokenResponse) -> Result<Session> {
     })
 }
 
-pub fn login(root: &Path, client: String, cancel: &AtomicBool) -> Result<Accounts> {
+fn authorization_url(client: &str, redirect: &str, hint: &str) -> Result<(Url, String, String)> {
+    let (url, state, verifier) = msa::get_secure_login_data(client, redirect, None);
+    let mut url = Url::parse(&url)?;
+    if hint.trim().is_empty() {
+        url.query_pairs_mut()
+            .append_pair("prompt", "select_account");
+    } else {
+        url.query_pairs_mut().append_pair("login_hint", hint.trim());
+    }
+    Ok((url, state, verifier))
+}
+
+pub fn login(root: &Path, client: String, hint: &str, cancel: &AtomicBool) -> Result<Accounts> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let redirect = format!(
         "http://localhost:{}/callback",
         listener.local_addr()?.port()
     );
-    let (url, state, verifier) = msa::get_secure_login_data(&client, &redirect, None);
-    open::that(&url).context("无法打开系统浏览器")?;
+    let (url, state, verifier) = authorization_url(&client, &redirect, hint)?;
+    open::that(url.as_str()).context("无法打开系统浏览器")?;
     let code = callback(listener, &state, cancel)?;
     let tokens = msa::get_authorization_token(&client, None, &redirect, &code, Some(&verifier))
         .context("微软授权码兑换失败，请检查应用 ID 和桌面回调地址")?;

@@ -123,7 +123,7 @@ enum Page {
 enum Update {
     Started(String, u32),
     Exited(String, Result<()>),
-    Imported(Instance),
+    Imported(Box<Instance>),
     Status(String),
     Finished(Result<()>, &'static str),
 }
@@ -142,6 +142,7 @@ pub struct Home {
     auth_id: Option<String>,
     auth_input: Entity<TextInput>,
     auth_edit: bool,
+    launch_after_login: Option<String>,
     login_cancel: Option<Arc<AtomicBool>>,
     logging_in: bool,
     instances: Vec<Instance>,
@@ -224,6 +225,7 @@ impl Home {
                     .max_len(64)
             }),
             auth_edit: false,
+            launch_after_login: None,
             login_cancel: None,
             manager: manager::Manager::new(&root, window, cx),
             hub: hub::Hub::new(window, cx),
@@ -305,7 +307,8 @@ impl Home {
         }
         if !install_only && self.accounts.current().is_none() {
             self.open_accounts(cx);
-            self.status = "请添加或选择账号，然后启动游戏".into();
+            self.launch_after_login = Some(self.instances[self.selected].id.clone());
+            self.status = "请选择账号，登录后将启动此实例".into();
             return;
         }
         let cancel = Arc::new(AtomicBool::new(false));
@@ -376,7 +379,7 @@ impl Home {
                                 home.outcomes.insert(id, (failed, msg));
                             }
                             Update::Imported(item) => {
-                                home.instances.push(item);
+                                home.instances.push(*item);
                                 home.selected = home.instances.len() - 1;
                                 home.page = Page::Detail;
                             }
@@ -446,10 +449,13 @@ impl Home {
     }
 
     fn open(&mut self, relative: &str, cx: &mut Context<Self>) {
-        let path = self.instances[self.selected]
-            .path(&self.root)
-            .join(relative);
+        let item = &self.instances[self.selected];
         let result = (|| -> Result<()> {
+            let path = if let Some(subdir) = relative.strip_prefix("game/") {
+                item.game_dir(&self.root)?.join(subdir)
+            } else {
+                item.path(&self.root).join(relative)
+            };
             if relative.ends_with(".log") {
                 ensure!(path.is_file(), "这次启动尚未生成该日志");
                 Command::new("notepad.exe").arg(path).spawn()?;
@@ -689,13 +695,13 @@ impl Home {
                         )))
                         .child(heading(&item.name))
                         .child(div().text_sm().text_color(rgb(MUTED)).child(format!(
-                            "游戏版本 {}     /     {}     /     独立游戏目录",
+                            "游戏版本 {}     /     {}     /     {}",
                             item.version,
                             format_args!(
                                 "{} {}",
                                 item.loader.label(),
                                 item.loader_version.as_deref().unwrap_or("")
-                            )
+                            ), item.external.as_ref().map_or("独立游戏目录", |_| "原目录启动")
                         ))),
                     0,
                 ),
@@ -934,10 +940,10 @@ impl Home {
     }
 
     fn refresh_mods(&mut self, cx: &mut Context<Self>) {
-        let dir = self.instances[self.selected]
-            .path(&self.root)
-            .join("game/mods");
-        match mods::installed(&dir) {
+        let result = self.instances[self.selected]
+            .game_dir(&self.root)
+            .and_then(|dir| mods::installed(&dir.join("mods")));
+        match result {
             Ok(jars) => self.jars = jars,
             Err(e) => self.message(Err(e), cx),
         }
@@ -1218,6 +1224,9 @@ fn panel(title: &str) -> Div {
 
 impl Render for Home {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.page != Page::Accounts {
+            self.launch_after_login = None;
+        }
         let frame = self.navigation.frame(
             motion::Destination {
                 page: self.page,

@@ -102,8 +102,8 @@ pub fn installed(dir: &Path) -> Result<Vec<String>> {
 }
 
 pub fn toggle(root: &Path, item: &Instance, name: &str) -> Result<()> {
-    let _lock = crate::library::lock_instance(root, &item.path(root), "实例正在使用")?;
-    let dir = item.path(root).join("game/mods");
+    let _lock = crate::library::lock_instance(root, item, "实例正在使用")?;
+    let dir = item.game_dir(root)?.join("mods");
     let base = name.strip_suffix(".disabled").unwrap_or(name);
     ensure!(jar_name(base), "模组文件名无效");
     let next = if name == base {
@@ -123,7 +123,7 @@ pub fn install(
     cancel: &AtomicBool,
     report: impl Fn(String) + Sync,
 ) -> Result<()> {
-    let _lock = crate::library::lock_instance(root, &item.path(root), "实例正在使用")?;
+    let _lock = crate::library::lock_instance(root, item, "实例正在使用")?;
     let downloads = Downloads::new(cancel, &report)?;
     let target = loader(item)?;
     let query = [
@@ -137,7 +137,7 @@ pub fn install(
     let mut resolved = HashMap::new();
     let mut files = Vec::new();
     let mut names = HashSet::new();
-    let mods = item.path(root).join("game/mods");
+    let mods = item.game_dir(root)?.join("mods");
     fs::create_dir_all(&mods)?;
     let temp = tempfile::tempdir_in(&mods)?;
     report("解析模组及必需依赖".into());

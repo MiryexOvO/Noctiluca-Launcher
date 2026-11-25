@@ -7,6 +7,7 @@ pub(super) struct Profiles {
     name: Entity<TextInput>,
     server: Entity<TextInput>,
     username: Entity<TextInput>,
+    microsoft_account: Entity<TextInput>,
     password: Entity<TextInput>,
     avatar: Option<PathBuf>,
     ticket: u64,
@@ -42,6 +43,7 @@ impl Profiles {
             kind: Kind::Microsoft,
             name: field("角色名", "游戏中的角色名"),
             server: field("认证服务器", "https://example.org/api/yggdrasil/"),
+            microsoft_account: field("微软账号", "邮箱、手机号或 Skype（可选）"),
             username: field("认证站账号", "认证站用户名或邮箱"),
             password: cx.new(|cx| {
                 TextInput::new(window, cx)
@@ -216,6 +218,7 @@ impl Home {
             .into_any_element()
     }
     pub(super) fn open_accounts(&mut self, cx: &mut Context<Self>) {
+        self.launch_after_login = None;
         self.page = Page::Accounts;
         self.failed = false;
         self.status = "就绪".into();
@@ -228,7 +231,7 @@ impl Home {
                 None
             }
         };
-        self.auth_edit = self.auth_id.is_none();
+        self.auth_edit = false;
         self.auth_input.update(cx, |f, cx| {
             f.set_text(self.auth_id.clone().unwrap_or_default(), cx)
         });
@@ -248,6 +251,20 @@ impl Home {
         }
         cx.notify();
     }
+    fn signed_in(&mut self, result: Result<Accounts>, cx: &mut Context<Self>) {
+        let ready = result
+            .as_ref()
+            .is_ok_and(|accounts| accounts.current().is_some());
+        self.account_result(result, cx);
+        if ready
+            && self.page == Page::Accounts
+            && let Some(id) = self.launch_after_login.take()
+            && let Some(index) = self.instances.iter().position(|i| i.id == id)
+        {
+            self.show_instance(index, cx);
+            self.play(false, cx);
+        }
+    }
     fn authenticate(&mut self, cx: &mut Context<Self>) {
         if self.logging_in {
             return;
@@ -255,17 +272,17 @@ impl Home {
         let name = self.profiles.name.read(cx).text().trim().to_owned();
         if self.profiles.kind == Kind::Offline {
             let r = Player::offline(&name).and_then(|p| accounts::add(&self.root, p, None));
-            self.account_result(r, cx);
+            self.signed_in(r, cx);
             return;
         }
         let kind = self.profiles.kind;
         let client = self.auth_id.clone();
         if kind == Kind::Microsoft && client.is_none() {
-            self.auth_edit = true;
-            cx.notify();
+            self.message(Err(anyhow::anyhow!("此版本尚未配置微软登录服务")), cx);
             return;
         }
         let root = self.root.clone();
+        let hint = self.profiles.microsoft_account.read(cx).text().to_owned();
         let provider = self.profiles.server.read(cx).text().to_owned();
         let user = self.profiles.username.read(cx).text().to_owned();
         let password = self.profiles.password.read(cx).text().to_owned();
@@ -284,7 +301,7 @@ impl Home {
         .into();
         let task = cx.background_executor().spawn(async move {
             match client {
-                Some(id) if kind == Kind::Microsoft => accounts::login(&root, id, &cancel),
+                Some(id) if kind == Kind::Microsoft => accounts::login(&root, id, &hint, &cancel),
                 _ => crate::third_party::login(&root, &provider, &user, &password, &name),
             }
         });
@@ -293,19 +310,67 @@ impl Home {
             let _ = view.update(cx, |h, cx| {
                 h.logging_in = false;
                 h.login_cancel = None;
-                h.account_result(result, cx);
+                h.signed_in(result, cx);
             });
         })
         .detach();
         cx.notify();
     }
     pub(super) fn account_page(&self, cx: &Context<Self>) -> impl IntoElement {
+        if self.auth_edit {
+            return div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(heading("登录服务设置"))
+                .child(
+                    panel("Microsoft 公共客户端")
+                        .child(Input::new(&self.auth_input))
+                        .child(kicker("桌面应用回调地址  ·  http://localhost/callback"))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(Button::new("save-client", "保存设置").primary().on_click(
+                                    cx.listener(|h, _, _, cx| {
+                                        match accounts::save_client(
+                                            &h.root,
+                                            h.auth_input.read(cx).text(),
+                                        ) {
+                                            Ok(id) => {
+                                                h.auth_id = Some(id);
+                                                h.auth_edit = false;
+                                                h.status = "登录服务设置已保存".into();
+                                                h.failed = false;
+                                            }
+                                            Err(err) => h.message(Err(err), cx),
+                                        }
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(Button::new("close-client-settings", "返回账号").on_click(
+                                    cx.listener(|h, _, _, cx| {
+                                        h.auth_edit = false;
+                                        cx.notify();
+                                    }),
+                                )),
+                        ),
+                );
+        }
         let mut page = div().flex().flex_col().gap_3().child(
             div()
                 .flex()
                 .items_center()
                 .justify_between()
                 .child(heading("游戏账号"))
+                .child(
+                    Button::new("account-settings", "登录服务设置")
+                        .disabled(self.logging_in)
+                        .on_click(cx.listener(|h, _, _, cx| {
+                            h.auth_edit = true;
+                            cx.notify();
+                        })),
+                )
                 .child(
                     Button::new("new-profile", "添加账号")
                         .icon(IconName::UserPlus)
@@ -357,21 +422,12 @@ impl Home {
             let mut form = panel("添加账号").child(choices);
             match self.profiles.kind {
                 Kind::Microsoft => {
-                    if self.auth_edit {
-                        form=form.child(kicker("Noctiluca 的 Microsoft Entra 应用程序（客户端）ID")).child(Input::new(&self.auth_input))
-                        .child(kicker("桌面应用回调地址  ·  http://localhost/callback"))
-                        .child(div().flex().gap_2().child(Button::new("save-client","保存登录配置").on_click(cx.listener(|h,_,_,cx|{
-                            match accounts::save_client(&h.root,h.auth_input.read(cx).text()){Ok(id)=>{h.auth_id=Some(id);h.auth_edit=false;h.status="应用 ID 已保存".into();h.failed=false;}Err(e)=>h.message(Err(e),cx)}cx.notify();
-                        }))).child(Button::new("client-guide","注册说明").on_click(cx.listener(|h,_,_,cx|h.open_url("https://learn.microsoft.com/entra/identity-platform/quickstart-register-app",cx)))));
-                    } else {
-                        form = form.child(
-                            Button::new("edit-client", "登录配置")
-                                .disabled(self.logging_in)
-                                .on_click(cx.listener(|h, _, _, cx| {
-                                    h.auth_edit = true;
-                                    cx.notify();
-                                })),
-                        );
+                    form = form
+                        .child(kicker("微软账号"))
+                        .child(Input::new(&self.profiles.microsoft_account))
+                        .child(kicker("在微软官方页面输入密码并完成验证。"));
+                    if self.auth_id.is_none() {
+                        form = form.child(kicker("此版本尚未配置微软登录服务。"));
                     }
                 }
                 Kind::Offline => {
@@ -401,8 +457,7 @@ impl Home {
                 .primary()
                 .disabled(
                     self.logging_in
-                        || (self.profiles.kind == Kind::Microsoft
-                            && (self.auth_id.is_none() || self.auth_edit)),
+                        || (self.profiles.kind == Kind::Microsoft && self.auth_id.is_none()),
                 )
                 .on_click(cx.listener(|h, _, _, cx| h.authenticate(cx))),
             );
@@ -440,7 +495,7 @@ impl Home {
                             .on_click(cx.listener(
                                 move |h, _, _, cx| {
                                     let r = accounts::select(&h.root, Some(key.clone()));
-                                    h.account_result(r, cx);
+                                    h.signed_in(r, cx);
                                 },
                             )),
                         )

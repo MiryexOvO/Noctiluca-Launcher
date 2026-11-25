@@ -7,7 +7,7 @@ Noctiluca 是用 Rust 和 Ely GPUI 编写的 Windows 原生 Minecraft Java 版�
 - 「下载中心 → 游戏下载」依次提供 NeoForge、Forge、Fabric。输入 Minecraft 版本后，可以浏览该版本可用的加载器构建，选择「安装到新实例」下载游戏、Java、资源和所选加载器。
 - 「下载中心 → 整合包」支持按加载器、游戏版本、名称和来源查找整合包。选择发布版本后，启动器按包清单安装到独立实例。也可以导入本地 Modrinth 的 `.mrpack` 或 CurseForge 的 `.zip`。如果基础游戏准备中断，选中已创建的实例，点击「安装 / 修复」继续。
 - Modrinth 可以直接使用。CurseForge 的在线搜索和有文件依赖的清单需要环境变量 `NOCTILUCA_CURSEFORGE_API_KEY`。文件须经作者授权第三方下载，目前支持模组、资源包和光影三种 CurseForge 文件类型。[CurseForge API](https://docs.curseforge.com/rest-api/)
-- 「实例管理」按加载器分组，可按名称、游戏版本或加载器搜索。用「添加已有目录」登记含有 `versions` 的游戏目录，选择识别出的版本，再用「复制到实例库」导入存档、配置和模组等游戏内容。新副本从启动器自己的目录运行，与来源目录分别保存进度。
+- 「实例管理」按加载器分组，可按名称、游戏版本或加载器搜索。点「添加已有目录」，选择 .minecraft、包含它的文件夹，或 versions 下的单个版本目录，扫描后在版本旁点「启动游戏」。游戏使用原目录的版本、运行库、资源、模组和存档。支持共用游戏目录与版本隔离目录。旧版已经复制过的实例仍使用各自的存档。
 - 一个实例启动后可以回到侧栏启动另一个。各实例有独立的进程、日志、存档、模组目录和本地 DLL 目录。运行状态与进程号显示在「实例管理」。同一实例持有独占锁，公共游戏资源的安装依次进行。
 
 - 「新建实例」支持按版本号搜索 Mojang 的正式版与快照。列表从 1.17 发布日起算。可选择原版、Fabric、Quilt、Forge 或 NeoForge。具体版本须得到对应加载器支持。
@@ -43,7 +43,7 @@ Noctiluca-data/
 侧栏显示当前角色的头像、游戏名和登录类型。可添加多个账号，切换角色并管理头像和角色名。
 
 - **离线** 输入角色名即可添加。首次安装游戏需要下载资源。服务器是否接受该身份取决于服务器的认证设置。选取本地皮肤 PNG 可以设置启动器里的头像。
-- **Microsoft** 在「添加账号 → Microsoft」中保存 Microsoft Entra 应用的公开客户端 ID，然后通过系统浏览器授权。应用须支持个人微软账号、桌面回调 `http://localhost/callback` 并获准访问 Minecraft 服务。启动器校验游戏授权和 Java 角色，刷新令牌保存在 Windows 凭据管理器。[微软桌面回调配置](https://learn.microsoft.com/en-us/entra/identity-platform/reply-url)
+- **Microsoft** 在「添加账号 → Microsoft」可先填微软账号，点击「微软正版登录」，在微软官方页面输入密码或使用通行密钥。开发者可在「游戏账号 → 登录服务设置」中配置本应用的公开客户端 ID。应用须支持个人微软账号、桌面回调 `http://localhost/callback` 并获准访问 Minecraft 服务。启动器校验游戏授权和 Java 角色，刷新令牌保存在 Windows 凭据管理器。[微软桌面回调配置](https://learn.microsoft.com/en-us/entra/identity-platform/reply-url)
 - **第三方** 填写认证站提供的 Yggdrasil HTTPS API 根地址和该站账号。多角色账号可指定角色名。游戏使用与该站配套的 authlib-injector 登录。[authlib-injector 项目](https://github.com/yushijinhun/authlib-injector)
 
 ## 从源码构建

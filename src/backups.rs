@@ -58,13 +58,38 @@ pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 }
 
 // Build outside the library: readers only see a complete folder after the same-volume rename.
-fn snapshot(root: &Path, source: &Path, dest: &Path, item: &Instance) -> Result<()> {
+fn snapshot(
+    root: &Path,
+    source: &Path,
+    dest: &Path,
+    item: &Instance,
+    external: Option<&crate::folders::External>,
+) -> Result<()> {
     fs::create_dir_all(dest.parent().context("缺少目标目录")?)?;
     let temp = tempfile::tempdir_in(root)?;
-    for part in ["game", "loader.json"] {
-        let src = source.join(part);
-        if src.try_exists()? {
-            copy_tree(&src, &temp.path().join(part))?;
+    if let Some(link) = external {
+        let game = link.game_dir()?;
+        let contents = temp.path().join("game");
+        fs::create_dir(&contents)?;
+        for part in crate::folders::CONTENT {
+            let from = game.join(part);
+            if from.try_exists()? {
+                ensure!(
+                    !temp
+                        .path()
+                        .canonicalize()?
+                        .starts_with(from.canonicalize()?),
+                    "目标与来源目录重叠"
+                );
+                copy_tree(&from, &contents.join(part))?;
+            }
+        }
+    } else {
+        for part in ["game", "loader.json"] {
+            let src = source.join(part);
+            if src.try_exists()? {
+                copy_tree(&src, &temp.path().join(part))?;
+            }
         }
     }
     fs::write(
@@ -77,17 +102,19 @@ fn snapshot(root: &Path, source: &Path, dest: &Path, item: &Instance) -> Result<
 
 pub fn create(root: &Path, item: &Instance) -> Result<()> {
     let source = item.path(root);
-    let _lock = lock_instance(root, &source, "请先退出游戏再备份")?;
+    let _lock = lock_instance(root, item, "请先退出游戏再备份")?;
     let dest = root
         .join("backups")
         .join(&item.id)
         .join(Uuid::new_v4().to_string());
-    snapshot(root, &source, &dest, item)
+    let mut stored = item.clone();
+    stored.external = None;
+    snapshot(root, &source, &dest, &stored, item.external.as_ref())
 }
 
 pub fn duplicate(root: &Path, item: &Instance, backup: Option<&Path>) -> Result<Instance> {
     let live = item.path(root);
-    let _lock = lock_instance(root, &live, "请先退出游戏再复制实例")?;
+    let _lock = lock_instance(root, item, "请先退出游戏再复制实例")?;
     let source = backup.unwrap_or(&live);
     let mut new: Instance = serde_json::from_slice(&fs::read(source.join("instance.json"))?)?;
     ensure!(
@@ -100,6 +127,7 @@ pub fn duplicate(root: &Path, item: &Instance, backup: Option<&Path>) -> Result<
         new.name,
         if backup.is_some() { "恢复" } else { "副本" }
     );
-    snapshot(root, source, &new.path(root), &new)?;
+    let external = new.external.take();
+    snapshot(root, source, &new.path(root), &new, external.as_ref())?;
     Ok(new)
 }

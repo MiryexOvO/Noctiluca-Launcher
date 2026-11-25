@@ -89,7 +89,7 @@ impl Home {
                     }
                 };
                 let item = crate::packs::import(&root, &path, &cancel, report)?;
-                let _ = tx.try_send(Update::Imported(item.clone()));
+                let _ = tx.try_send(Update::Imported(Box::new(item.clone())));
                 game::play(&root, &item, None, true, &cancel, report)
             })();
             let _ = tx.try_send(Update::Finished(result, "整合包、游戏与加载器已安装"));
