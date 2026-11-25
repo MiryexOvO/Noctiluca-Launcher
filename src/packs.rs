@@ -31,6 +31,10 @@ pub(crate) struct PackFile {
     pub(crate) path: String,
     pub(crate) hashes: HashMap<String, String>,
     pub(crate) downloads: Vec<String>,
+    #[serde(skip)]
+    pub(crate) website: Option<String>,
+    #[serde(skip)]
+    pub(crate) automatic: Option<Url>,
     #[serde(default)]
     pub(crate) env: HashMap<String, String>,
 }
@@ -58,15 +62,21 @@ struct CurseLoader {
     primary: bool,
 }
 
-fn read_index(zip: &mut ZipArchive<File>) -> Result<(Index, Vec<String>, bool)> {
+struct Manifest {
+    index: Index,
+    prefixes: Vec<String>,
+    curse: Option<Vec<crate::curse::Requirement>>,
+}
+
+fn read_index(zip: &mut ZipArchive<File>) -> Result<Manifest> {
     if zip.index_for_name("modrinth.index.json").is_some() {
         let manifest = zip.by_name("modrinth.index.json")?;
         ensure!(manifest.size() <= 16 * 1024 * 1024, "整合包清单过大");
-        return Ok((
-            serde_json::from_reader(manifest)?,
-            vec!["overrides/".into(), "client-overrides/".into()],
-            false,
-        ));
+        return Ok(Manifest {
+            index: serde_json::from_reader(manifest)?,
+            prefixes: vec!["overrides/".into(), "client-overrides/".into()],
+            curse: None,
+        });
     }
     let manifest = zip
         .by_name("manifest.json")
@@ -102,18 +112,17 @@ fn read_index(zip: &mut ZipArchive<File>) -> Result<(Index, Vec<String>, bool)> 
         relative(prefix)?;
         vec![format!("{prefix}/")]
     };
-    let files = crate::curse::resolve(m.files)?;
-    Ok((
-        Index {
+    Ok(Manifest {
+        index: Index {
             format_version: 1,
             game: "minecraft".into(),
             name: m.name,
             dependencies: deps,
-            files,
+            files: vec![],
         },
         prefixes,
-        true,
-    ))
+        curse: Some(m.files),
+    })
 }
 
 fn relative(name: &str) -> Result<PathBuf> {
@@ -158,14 +167,77 @@ fn download_host(url: &Url, curse: bool) -> bool {
         })
 }
 
-pub fn import(
-    root: &Path,
-    path: &Path,
-    cancel: &AtomicBool,
-    report: impl Fn(String) + Sync,
-) -> Result<Instance> {
-    let mut zip = ZipArchive::new(File::open(path)?)?;
-    let (index, prefixes, curse) = read_index(&mut zip)?;
+pub struct Preview {
+    pub instance: Instance,
+    pub files: Vec<PackFile>,
+    pub curse: bool,
+    pub metadata_error: Option<String>,
+    pub optional_error: Option<String>,
+    pub required_count: usize,
+    pub optional_count: usize,
+    archive: File,
+    prefixes: Vec<String>,
+    cache: tempfile::TempDir,
+}
+
+impl PackFile {
+    pub fn optional(&self) -> bool {
+        self.env.get("client").is_some_and(|v| v == "optional")
+    }
+
+    pub fn source(&self, curse: bool) -> Option<Url> {
+        self.downloads
+            .iter()
+            .filter_map(|s| Url::parse(s).ok())
+            .find(|u| download_host(u, curse))
+    }
+
+    pub fn website(&self) -> Option<String> {
+        if let Some(url) = &self.website {
+            return Some(url.clone());
+        }
+        for value in &self.downloads {
+            let Ok(url) = Url::parse(value) else { continue };
+            if url.scheme() == "https"
+                && url.host_str() == Some("cdn.modrinth.com")
+                && let Some(segments) = url.path_segments()
+                && let ["data", id, ..] = segments.collect::<Vec<_>>().as_slice()
+                && !id.is_empty()
+                && id.bytes().all(|c| c.is_ascii_alphanumeric())
+            {
+                return Some(format!("https://modrinth.com/project/{id}"));
+            }
+        }
+        self.source(false).map(Into::into)
+    }
+}
+
+pub fn preview(root: &Path, path: &Path) -> Result<Preview> {
+    let mut zip = ZipArchive::new(File::open(path).context("无法打开所选整合包")?)
+        .context("无法读取整合包压缩文件")?;
+    let Manifest {
+        mut index,
+        prefixes,
+        curse,
+    } = read_index(&mut zip)?;
+    let mut metadata_error = None;
+    let mut optional_error = None;
+    let mut required_count = 0;
+    let mut optional_count = 0;
+    if let Some(ref requirements) = curse {
+        required_count = requirements.iter().filter(|f| f.required()).count();
+        optional_count = requirements.len() - required_count;
+        match crate::curse::resolve(requirements, true) {
+            Ok(files) => index.files = files,
+            Err(e) => metadata_error = Some(format!("{e:#}")),
+        }
+        if metadata_error.is_none() {
+            match crate::curse::resolve(requirements, false) {
+                Ok(files) => index.files.extend(files),
+                Err(e) => optional_error = Some(format!("{e:#}")),
+            }
+        }
+    }
     ensure!(
         index.format_version == 1 && index.game == "minecraft",
         "不支持此整合包格式"
@@ -189,108 +261,186 @@ pub fn import(
         };
         instance.loader_version = Some(v);
     }
-    let temp = tempfile::tempdir_in(root)?;
-    let game = temp.path().join("game");
-    fs::create_dir_all(&game)?;
-    let mut downloads = Downloads::new(cancel, &report)?;
-    downloads.http = crate::download::client_builder()
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if download_host(attempt.url(), curse) && attempt.previous().len() < 8 {
-                attempt.follow()
-            } else {
-                attempt.error("整合包下载跳转到不受支持的地址")
-            }
-        }))
-        .build()?;
-    let mut tasks = Vec::new();
-    let mut hashes = Vec::new();
     let mut names = HashSet::new();
-    for file in index.files {
-        if matches!(
-            file.env.get("client").map(String::as_str),
-            Some("optional" | "unsupported")
-        ) {
+    let mut files = Vec::new();
+    for mut file in index.files {
+        if file.env.get("client").is_some_and(|v| v == "unsupported") {
             continue;
         }
-        let dest = game.join(relative(&file.path)?);
-        ensure!(names.insert(file.path.to_lowercase()), "清单包含重复文件");
-        let url = file
-            .downloads
-            .iter()
-            .filter_map(|s| Url::parse(s).ok())
-            .find(|url| download_host(url, curse))
-            .context("没有可用的整合包下载来源")?;
-        let hash = file
-            .hashes
-            .get("sha1")
-            .context("整合包文件缺少 SHA-1")?
-            .clone();
-        if !curse {
-            hashes.push((
-                dest.clone(),
-                file.hashes
-                    .get("sha512")
-                    .context("整合包文件缺少 SHA-512")?
-                    .clone(),
-            ));
-        }
-        tasks.push(DownloadTask {
-            url: url.to_string(),
-            destination: dest,
-            checksum: Some(Checksum::Sha1(hash)),
-            label: file.path,
-        });
-    }
-    downloads.batch(&game, "整合包文件", tasks)?;
-    for (path, expected) in hashes {
-        downloads.check()?;
-        let mut hash = Sha512::new();
-        let mut input = File::open(path)?;
-        let mut buffer = [0; 64 * 1024];
-        loop {
-            let n = input.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            hash.update(&buffer[..n]);
-        }
-        let actual: String = hash
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        relative(&file.path)?;
         ensure!(
-            actual.eq_ignore_ascii_case(&expected),
-            "整合包 SHA-512 校验失败"
+            names.insert(file.path.to_lowercase()),
+            "清单包含重复文件：{}",
+            file.path
         );
-    }
-    report("应用整合包配置".into());
-    for prefix in prefixes {
-        for idx in 0..zip.len() {
-            downloads.check()?;
-            let mut entry = zip.by_index(idx)?;
-            let Some(rel) = entry.name().strip_prefix(&prefix) else {
-                continue;
-            };
-            let rel = rel.trim_end_matches('/');
-            if rel.is_empty() {
+        for (key, len) in [("sha1", 40), ("sha512", 128)] {
+            if key == "sha512" && curse.is_some() {
                 continue;
             }
-            let dest = game.join(relative(rel)?);
-            ensure!(!entry.is_symlink(), "整合包包含符号链接");
-            if entry.is_dir() {
-                fs::create_dir_all(dest)?;
-                continue;
-            }
-            fs::create_dir_all(dest.parent().context("无效文件夹")?)?;
-            io::copy(&mut entry, &mut File::create(dest)?)?;
+            ensure!(
+                file.hashes
+                    .get(key)
+                    .is_some_and(|s| s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())),
+                "{} 缺少有效的 {key} 校验值",
+                file.path
+            );
         }
+        file.automatic = file.source(curse.is_some());
+        files.push(file);
     }
-    downloads.check()?;
-    fs::write(
-        temp.path().join("instance.json"),
-        serde_json::to_vec_pretty(&instance)?,
-    )?;
-    fs::rename(temp.path(), instance.path(root))?;
-    Ok(instance)
+    if metadata_error.is_none() && optional_error.is_none() {
+        optional_count = files.iter().filter(|f| f.optional()).count();
+        required_count = files.len() - optional_count;
+    }
+    Ok(Preview {
+        instance,
+        files,
+        curse: curse.is_some(),
+        metadata_error,
+        optional_error,
+        required_count,
+        optional_count,
+        archive: zip.into_inner(),
+        prefixes,
+        cache: tempfile::tempdir_in(root)?,
+    })
+}
+
+impl Preview {
+    fn cache_path(&self, index: usize) -> PathBuf {
+        self.cache.path().join(index.to_string())
+    }
+
+    pub fn supply(&self, index: usize, source: &Path, cancel: &AtomicBool) -> Result<()> {
+        let file = self.files.get(index).context("清单文件不存在")?;
+        let mut input = File::open(source).context("无法读取所选文件")?;
+        let mut copy = tempfile::NamedTempFile::new_in(self.cache.path())?;
+        io::copy(&mut input, &mut copy)?;
+        ensure!(
+            mc_launcher_core::io::hash::sha1_file(copy.path())?
+                .eq_ignore_ascii_case(&file.hashes["sha1"]),
+            "{} 与清单 SHA-1 不符，请选择指定版本",
+            file.path
+        );
+        self.check_sha512(file, copy.path(), cancel)?;
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "已取消校验"
+        );
+        copy.persist(self.cache_path(index))?;
+        Ok(())
+    }
+
+    fn check_sha512(&self, file: &PackFile, path: &Path, cancel: &AtomicBool) -> Result<()> {
+        if let Some(expected) = file.hashes.get("sha512") {
+            let mut hash = Sha512::new();
+            let mut input = File::open(path)?;
+            let mut buffer = [0; 64 * 1024];
+            loop {
+                ensure!(
+                    !cancel.load(std::sync::atomic::Ordering::Relaxed),
+                    "已取消校验"
+                );
+                let n = input.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                hash.update(&buffer[..n]);
+            }
+            ensure!(
+                hex::encode(hash.finalize()).eq_ignore_ascii_case(expected),
+                "{} 与清单 SHA-512 不符",
+                file.path
+            );
+        }
+        Ok(())
+    }
+
+    pub fn install(
+        &self,
+        root: &Path,
+        optional: &HashSet<usize>,
+        cancel: &AtomicBool,
+        report: impl Fn(String) + Sync,
+    ) -> Result<Instance> {
+        if let Some(error) = &self.metadata_error {
+            bail!("{error}");
+        }
+        let instance = &self.instance;
+        let curse = self.curse;
+        let mut downloads = Downloads::new(cancel, &report)?;
+        downloads.http = crate::download::client_builder()
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if download_host(attempt.url(), curse) && attempt.previous().len() < 8 {
+                    attempt.follow()
+                } else {
+                    attempt.error("整合包下载跳转到不受支持的地址")
+                }
+            }))
+            .build()?;
+        let selected: Vec<_> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(i, f)| !f.optional() || optional.contains(i))
+            .collect();
+        let mut tasks = Vec::new();
+        for &(i, file) in &selected {
+            let destination = self.cache_path(i);
+            if let Some(url) = &file.automatic {
+                tasks.push(DownloadTask {
+                    url: url.to_string(),
+                    destination,
+                    checksum: Some(Checksum::Sha1(file.hashes["sha1"].clone())),
+                    label: file.path.clone(),
+                });
+            } else {
+                ensure!(destination.is_file(), "请补齐文件：{}", file.path);
+            }
+        }
+        downloads.batch(self.cache.path(), "整合包文件", tasks)?;
+        let temp = tempfile::tempdir_in(root)?;
+        let game = temp.path().join("game");
+        fs::create_dir_all(&game)?;
+        for &(i, file) in &selected {
+            downloads.check()?;
+            let cached = self.cache_path(i);
+            self.check_sha512(file, &cached, cancel)
+                .with_context(|| crate::download::FileFailure::new("整合包校验", &file.path))?;
+            let dest = game.join(relative(&file.path)?);
+            fs::create_dir_all(dest.parent().context("无效文件路径")?)?;
+            fs::copy(cached, dest)?;
+        }
+        report("应用整合包配置".into());
+        let mut zip = ZipArchive::new(self.archive.try_clone()?)?;
+        for prefix in &self.prefixes {
+            for idx in 0..zip.len() {
+                downloads.check()?;
+                let mut entry = zip.by_index(idx)?;
+                let Some(rel) = entry.name().strip_prefix(prefix.as_str()) else {
+                    continue;
+                };
+                let rel = rel.trim_end_matches('/');
+                if rel.is_empty() {
+                    continue;
+                }
+                let dest = game.join(relative(rel)?);
+                ensure!(!entry.is_symlink(), "整合包包含符号链接");
+                if entry.is_dir() {
+                    fs::create_dir_all(dest)?;
+                    continue;
+                }
+                fs::create_dir_all(dest.parent().context("无效文件夹")?)?;
+                io::copy(&mut entry, &mut File::create(dest)?)?;
+            }
+        }
+        downloads.check()?;
+        fs::write(
+            temp.path().join("instance.json"),
+            serde_json::to_vec_pretty(instance)?,
+        )?;
+        downloads.check()?;
+        fs::rename(temp.path(), instance.path(root))?;
+        Ok(instance.clone())
+    }
 }

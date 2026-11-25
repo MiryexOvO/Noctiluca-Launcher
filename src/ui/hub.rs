@@ -67,9 +67,10 @@ enum Results {
 }
 impl Home {
     pub(super) fn install_pack(&mut self, pack: Pack, cx: &mut Context<Self>) {
-        if self.cancel.is_some() {
+        if self.cancel.is_some() || self.copying || self.logging_in {
             return;
         }
+        self.draft = None;
         let root = self.root.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
@@ -81,18 +82,18 @@ impl Home {
             let report = |s| {
                 let _ = tx.try_send(Update::Status(s));
             };
-            let result = (|| -> Result<()> {
+            let result = (|| -> Result<_> {
                 let path = match pack {
                     Pack::Local(p) => p,
                     Pack::Online(file) => {
                         file.archive(&root, &Downloads::new(&cancel, &report)?)?
                     }
                 };
-                let item = crate::packs::import(&root, &path, &cancel, report)?;
-                let _ = tx.try_send(Update::Imported(Box::new(item.clone())));
-                game::play(&root, &item, None, true, &cancel, report)
+                let preview = crate::packs::preview(&root, &path)?;
+                anyhow::ensure!(!cancel.load(Ordering::Relaxed), "已取消预览");
+                Ok((path, Box::new(preview)))
             })();
-            let _ = tx.try_send(Update::Finished(result, "整合包、游戏与加载器已安装"));
+            let _ = tx.try_send(Update::PackPreview(result));
         });
         self.listen(rx, cx);
     }
@@ -394,9 +395,17 @@ impl Home {
                         .gap_2()
                         .child(div().flex_1().min_w_0().child(name))
                         .child(
-                            Button::new(("install-result", i), "安装到新实例")
-                                .disabled(disabled)
-                                .on_click(cx.listener(move |home, _, _, cx| {
+                            Button::new(
+                                ("install-result", i),
+                                if h.packs {
+                                    "预览整合包"
+                                } else {
+                                    "安装到新实例"
+                                },
+                            )
+                            .disabled(disabled)
+                            .on_click(cx.listener(
+                                move |home, _, _, cx| {
                                     if home.hub.packs {
                                         home.install_pack(
                                             Pack::Online(home.hub.releases[i].clone()),
@@ -407,7 +416,8 @@ impl Home {
                                             home.install_build(home.hub.builds[i].clone(), cx);
                                         home.message(result, cx);
                                     }
-                                })),
+                                },
+                            )),
                         ),
                 );
             }

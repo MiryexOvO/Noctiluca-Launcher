@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Component, Path, PathBuf},
     process::Command,
@@ -26,22 +27,123 @@ pub fn hide_console(command: &mut Command) {
 }
 
 fn version_of(java: &Path) -> Option<u32> {
-    let mut command = Command::new(java);
+    // javaw is the GUI launcher. Its console sibling reports the same VM version.
+    let console = java.with_file_name("java.exe");
+    let probe = if java.file_name()?.eq_ignore_ascii_case("javaw.exe") && console.is_file() {
+        console.as_path()
+    } else {
+        java
+    };
+    let mut command = Command::new(probe);
     hide_console(&mut command);
     let reply = command.arg("-version").output().ok()?;
     if !reply.status.success() {
         return None;
     }
-    let output = String::from_utf8_lossy(&reply.stderr);
-    let version = output
-        .lines()
-        .find_map(|line| line.split_once("version \"").map(|(_, s)| s))?;
-    version
-        .trim_start_matches("1.")
-        .split(|c: char| !c.is_ascii_digit())
-        .next()?
-        .parse()
-        .ok()
+    [reply.stderr, reply.stdout].iter().find_map(|bytes| {
+        let output = String::from_utf8_lossy(bytes);
+        let version = output
+            .lines()
+            .find_map(|line| line.split_once("version \"").map(|(_, s)| s))?;
+        version
+            .trim_start_matches("1.")
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()
+    })
+}
+
+fn child_directories(path: &Path) -> impl Iterator<Item = PathBuf> {
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+}
+
+fn installed_candidates(shared: &Path, platform: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for key in ["JAVA_HOME", "JDK_HOME"] {
+        if let Some(home) = env::var_os(key) {
+            paths.push(PathBuf::from(home).join("bin/java.exe"));
+        }
+    }
+    if let Some(path) = env::var_os("PATH") {
+        paths.extend(
+            env::split_paths(&path)
+                .filter(|dir| dir.is_absolute())
+                .map(|dir| dir.join("java.exe")),
+        );
+    }
+    for home in child_directories(&shared.join("runtime").join(platform)) {
+        if home.join("installed").is_file() {
+            paths.push(home.join("bin/java.exe"));
+        }
+    }
+    let mut roots = Vec::new();
+    for key in ["ProgramFiles", "ProgramW6432", "LOCALAPPDATA"] {
+        if let Some(base) = env::var_os(key) {
+            let mut base = PathBuf::from(base);
+            if key == "LOCALAPPDATA" {
+                base.push("Programs");
+            }
+            for vendor in [
+                "Java",
+                "Eclipse Adoptium",
+                "Microsoft",
+                "Amazon Corretto",
+                "BellSoft",
+                "Zulu",
+                "Semeru",
+            ] {
+                roots.push(base.join(vendor));
+            }
+        }
+    }
+    if let Some(profile) = env::var_os("USERPROFILE") {
+        roots.push(PathBuf::from(profile).join(".jdks"));
+    }
+    roots.sort();
+    roots.dedup();
+    for root in roots {
+        paths.extend(child_directories(&root).map(|dir| dir.join("bin/java.exe")));
+    }
+    if let Some(appdata) = env::var_os("APPDATA") {
+        for component in child_directories(&PathBuf::from(appdata).join(".minecraft/runtime")) {
+            if let Some(name) = component.file_name() {
+                paths.push(component.join(platform).join(name).join("bin/java.exe"));
+            }
+        }
+    }
+    paths
+}
+
+fn choose_installed(
+    candidates: impl IntoIterator<Item = PathBuf>,
+    required: u32,
+    mut probe: impl FnMut(&Path) -> Option<u32>,
+) -> Option<(u32, PathBuf)> {
+    let mut best = None;
+    let mut seen = HashSet::new();
+    for path in candidates {
+        if !path.is_absolute() || !path.is_file() {
+            continue;
+        }
+        let identity = dunce::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !seen.insert(identity) {
+            continue;
+        }
+        let Some(major) = probe(&path) else { continue };
+        if major == required {
+            return Some((major, path));
+        }
+        if major > required && best.as_ref().is_none_or(|(v, _)| major < *v) {
+            best = Some((major, path));
+        }
+    }
+    best
 }
 
 pub fn select(
@@ -79,17 +181,16 @@ pub fn select(
     let managed = dir.join("bin/java.exe");
     let ready = dir.join("installed");
     if ready.is_file() && version_of(&managed) == Some(major) {
+        (downloads.report)(format!("使用已有 Java {major}"));
         return Ok(managed);
     }
-    let from_env = env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin/java.exe"));
-    for path in [from_env, Some(PathBuf::from("java"))]
-        .into_iter()
-        .flatten()
+    if let Some((found, path)) =
+        choose_installed(installed_candidates(shared, platform), major, version_of)
     {
-        if version_of(&path) == Some(major) {
-            return Ok(path);
-        }
+        (downloads.report)(format!("使用本机 Java {found} · {}", path.display()));
+        return Ok(path);
     }
+    downloads.check()?;
     (downloads.report)(format!("正在获取 Mojang Java {major}"));
     let all: RuntimeListJson = downloads
         .http

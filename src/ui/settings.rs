@@ -12,7 +12,7 @@ impl Fields {
         Self {
             java: cx.new(|cx| {
                 TextInput::new(window, cx)
-                    .placeholder("自动选择或安装 Java")
+                    .placeholder("自动检测本机 Java，缺少合适版本时下载")
                     .label("Java 可执行文件")
             }),
             jvm: cx.new(|cx| {

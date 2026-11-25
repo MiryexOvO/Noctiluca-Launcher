@@ -2,6 +2,7 @@ mod hub;
 mod instance_controls;
 mod manager;
 mod motion;
+mod pack_import;
 mod players;
 mod settings;
 mod titlebar;
@@ -89,12 +90,15 @@ enum Update {
     Started(String, u32),
     Exited(String, Result<()>),
     Imported(Box<Instance>),
+    PackPreview(Result<(PathBuf, Box<crate::packs::Preview>)>),
+    PackFinished(Result<()>, Option<String>),
     Status(String),
     Finished(Result<()>, &'static str),
 }
 
 pub struct Home {
     profiles: players::Profiles,
+    draft: Option<pack_import::Draft>,
     controls: instance_controls::Controls,
     navigation: motion::Navigation,
     _motion_preference: Subscription,
@@ -172,6 +176,7 @@ impl Home {
         };
         let mut home = Self {
             profiles: players::Profiles::new(window, cx),
+            draft: None,
             controls: instance_controls::Controls::new(&root),
             navigation: Default::default(),
             _motion_preference: cx.observe_window_activation(window, |_, window, cx| {
@@ -332,7 +337,12 @@ impl Home {
                                 }
                                 home.outcomes.insert(id, (failed, msg));
                             }
+                            Update::PackPreview(result) => home.preview_ready(result, cx),
+                            Update::PackFinished(result, launch) => {
+                                home.pack_finished(result, launch, cx)
+                            }
                             Update::Imported(item) => {
+                                home.draft = None;
                                 home.instances.push(*item);
                                 home.selected = home.instances.len() - 1;
                                 home.page = Page::Detail;
@@ -551,10 +561,17 @@ impl Home {
                     })),
             )
             .child(
-                Button::new("sidebar-import", "导入整合包")
-                    .full_width()
-                    .disabled(busy)
-                    .on_click(cx.listener(|home, _, _, cx| home.import_pack(cx))),
+                Button::new(
+                    "sidebar-import",
+                    if self.draft.is_some() {
+                        "继续导入整合包"
+                    } else {
+                        "导入整合包"
+                    },
+                )
+                .full_width()
+                .disabled(busy)
+                .on_click(cx.listener(|home, _, _, cx| home.import_pack(cx))),
             )
             .child(self.account_card(busy, cx))
             .child(
@@ -1024,6 +1041,14 @@ impl Home {
     }
 
     fn import_pack(&mut self, cx: &mut Context<Self>) {
+        if self.draft.is_some() {
+            self.page = Page::Import;
+            cx.notify();
+            return;
+        }
+        self.pick_pack(cx);
+    }
+    fn pick_pack(&mut self, cx: &mut Context<Self>) {
         let picker = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -1210,24 +1235,7 @@ impl Render for Home {
             Page::Mods => self.mods_page(cx).into_any_element(),
             Page::Console => self.console_page(cx).into_any_element(),
             Page::Settings => self.settings_page(cx).into_any_element(),
-            Page::Import => div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(heading("导入整合包"))
-                .when(self.cancel.is_some(), |el| {
-                    el.child(
-                        Button::new("cancel-import", "取消导入").on_click(cx.listener(
-                            |home, _, _, cx| {
-                                if let Some(cancel) = &home.cancel {
-                                    cancel.store(true, Ordering::Relaxed);
-                                }
-                                cx.notify();
-                            },
-                        )),
-                    )
-                })
-                .into_any_element(),
+            Page::Import => self.pack_page(cx).into_any_element(),
             Page::Backups => self.backups_page(cx).into_any_element(),
         };
         let view = cx.weak_entity();
@@ -1250,6 +1258,13 @@ impl Render for Home {
             }))
             .child(
                 div()
+                    .id("pack-drop")
+                    .on_drop(cx.listener(|home, paths: &ExternalPaths, _, cx| {
+                        home.drop_pack(paths.paths(), cx)
+                    }))
+                    .drag_over::<ExternalPaths>(|style, _, _, _| {
+                        style.border_1().border_color(rgb(ACCENT))
+                    })
                     .flex()
                     .flex_1()
                     .min_h_0()

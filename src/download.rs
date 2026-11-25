@@ -38,6 +38,25 @@ pub struct Downloads<'a> {
     pool: rayon::ThreadPool,
 }
 
+#[derive(Debug)]
+pub struct FileFailure {
+    pub label: String,
+    group: String,
+}
+impl FileFailure {
+    pub fn new(group: &str, label: &str) -> Self {
+        Self {
+            group: group.into(),
+            label: label.into(),
+        }
+    }
+}
+impl std::fmt::Display for FileFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} · {}", self.group, self.label)
+    }
+}
+
 impl<'a> Downloads<'a> {
     pub fn new(cancel: &'a AtomicBool, report: &'a (dyn Fn(String) + Sync)) -> Result<Self> {
         Ok(Self {
@@ -80,7 +99,7 @@ impl<'a> Downloads<'a> {
             unique.par_iter().try_for_each(|task| -> Result<()> {
                 self.check()?;
                 self.file(root, task)
-                    .with_context(|| format!("{} · {}", title, task.label))?;
+                    .with_context(|| FileFailure::new(title, &task.label))?;
                 let mut state = progress.lock().unwrap();
                 state.0 += 1;
                 if state.0 == total || state.1.elapsed() >= Duration::from_millis(350) {

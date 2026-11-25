@@ -48,6 +48,7 @@ fn loader_id(loader: Loader) -> Result<&'static str> {
 #[serde(rename_all = "camelCase")]
 struct Project {
     id: u64,
+    slug: String,
     name: String,
     summary: String,
     class_id: Option<u32>,
@@ -161,14 +162,22 @@ pub(super) struct Requirement {
     file: u64,
     required: bool,
 }
-pub(super) fn resolve(requirements: Vec<Requirement>) -> Result<Vec<PackFile>> {
-    let required: Vec<_> = requirements.into_iter().filter(|r| r.required).collect();
-    if required.is_empty() {
+impl Requirement {
+    pub(super) fn required(&self) -> bool {
+        self.required
+    }
+}
+pub(super) fn resolve(requirements: &[Requirement], required: bool) -> Result<Vec<PackFile>> {
+    let requirements: Vec<_> = requirements
+        .iter()
+        .filter(|r| r.required == required)
+        .collect();
+    if requirements.is_empty() {
         return Ok(vec![]);
     }
     let (http, key) = api()?;
     let mut resolved = vec![];
-    for chunk in required.chunks(50) {
+    for chunk in requirements.chunks(50) {
         let ids: Vec<_> = chunk.iter().map(|r| r.file).collect();
         let projects: Vec<_> = chunk.iter().map(|r| r.project).collect();
         let files: Vec<File> = get(http
@@ -188,10 +197,11 @@ pub(super) fn resolve(requirements: Vec<Requirement>) -> Result<Vec<PackFile>> {
                 .iter()
                 .find(|p| p.id == r.project)
                 .context("CurseForge 项目信息缺失")?;
-            let folder = match project.class_id {
-                Some(6) => "mods",
-                Some(12) => "resourcepacks",
-                Some(6552) => "shaderpacks",
+            let (folder, category) = match project.class_id {
+                Some(6) => ("mods", "mc-mods"),
+                Some(12) => ("resourcepacks", "texture-packs"),
+                Some(6552) => ("shaderpacks", "shaders"),
+                _ if !r.required => continue,
                 other => bail!(
                     "整合包包含暂不支持的内容类型 {:?}（{}）",
                     other,
@@ -204,9 +214,18 @@ pub(super) fn resolve(requirements: Vec<Requirement>) -> Result<Vec<PackFile>> {
             );
             resolved.push(PackFile {
                 path: format!("{folder}/{}", file.file_name),
-                downloads: vec![file.url()?],
+                downloads: file.download_url.clone().into_iter().collect(),
+                automatic: None,
                 hashes: HashMap::from([("sha1".into(), file.sha1()?)]),
-                env: HashMap::new(),
+                env: if r.required {
+                    HashMap::new()
+                } else {
+                    HashMap::from([("client".into(), "optional".into())])
+                },
+                website: Some(format!(
+                    "https://www.curseforge.com/minecraft/{category}/{}/files/{}",
+                    project.slug, file.id
+                )),
             });
         }
     }

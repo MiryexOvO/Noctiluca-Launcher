@@ -4006,6 +4006,7 @@ dependencies = [
  "chrono",
  "dunce",
  "ely-gpui-component",
+ "embed-resource",
  "gpui-pre",
  "gpui-pre-platform",
  "hex",
