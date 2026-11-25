@@ -257,7 +257,7 @@ impl Home {
             let r = market::install_resource(&root, &item, kind, &hit.id, &cancel, |s| {
                 let _ = tx.try_send(Update::Status(s));
             });
-            let _ = tx.try_send(Update::Finished(r, "资源已安装"));
+            let _ = tx.try_send(Update::Finished(r, "资源已安装".into()));
         });
         self.listen(rx, cx);
     }
@@ -433,7 +433,7 @@ impl Home {
             let result = result.map(|item| {
                 let _ = tx.try_send(Update::Changed(Box::new(item)));
             });
-            let _ = tx.try_send(Update::Finished(result, "加载器已更新"));
+            let _ = tx.try_send(Update::Finished(result, "加载器已更新".into()));
         });
         self.listen(rx, cx);
         cx.notify();

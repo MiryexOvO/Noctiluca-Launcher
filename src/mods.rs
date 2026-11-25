@@ -130,11 +130,35 @@ pub fn install(
     let mods = item.game_dir(root)?.join("mods");
     fs::create_dir_all(&mods)?;
     if let Some(project) = hit.project_id.strip_prefix("cf:") {
-        return install_curse(&mods, item, project.parse()?, &downloads);
+        return install_curse(&mods, item, project.parse()?, None, &downloads);
     }
-    install_modrinth(&mods, item, hit, &downloads)
+    install_modrinth(&mods, item, &hit.project_id, None, &downloads)
 }
-fn install_modrinth(mods: &Path, item: &Instance, hit: &Hit, downloads: &Downloads) -> Result<()> {
+pub fn install_pinned(
+    root: &Path,
+    item: &Instance,
+    file: &crate::market::Release,
+    downloads: &Downloads,
+) -> Result<()> {
+    let mods = item.game_dir(root)?.join("mods");
+    fs::create_dir_all(&mods)?;
+    match file.source {
+        crate::market::Source::Modrinth => {
+            install_modrinth(&mods, item, &file.project, Some(file), downloads)
+        }
+        crate::market::Source::CurseForge => {
+            install_curse(&mods, item, file.project.parse()?, Some(file), downloads)
+        }
+    }
+}
+
+fn install_modrinth(
+    mods: &Path,
+    item: &Instance,
+    project_id: &str,
+    pinned: Option<&crate::market::Release>,
+    downloads: &Downloads,
+) -> Result<()> {
     let target = loader(item)?;
     let query = [
         (
@@ -143,7 +167,7 @@ fn install_modrinth(mods: &Path, item: &Instance, hit: &Hit, downloads: &Downloa
         ),
         ("loaders", serde_json::json!([target]).to_string()),
     ];
-    let mut queue = vec![(Some(hit.project_id.clone()), None::<String>)];
+    let mut queue = vec![(Some(project_id.to_owned()), pinned.map(|f| f.id.clone()))];
     let mut resolved = HashMap::new();
     let mut files = Vec::new();
     let mut names = HashSet::new();
@@ -158,8 +182,8 @@ fn install_modrinth(mods: &Path, item: &Instance, hit: &Hit, downloads: &Downloa
             );
             continue;
         }
-        let version: Version = if let Some(id) = exact {
-            ensure!(safe_id(&id), "依赖版本 ID 无效");
+        let version: Version = if let Some(id) = &exact {
+            ensure!(safe_id(id), "依赖版本 ID 无效");
             downloads
                 .http
                 .get(format!("{API}/version/{id}"))
@@ -181,7 +205,11 @@ fn install_modrinth(mods: &Path, item: &Instance, hit: &Hit, downloads: &Downloa
                 .with_context(|| format!("项目 {id} 没有匹配的版本"))?
         };
         ensure!(
-            version.game_versions.contains(&item.version)
+            exact
+                .as_ref()
+                .is_none_or(|id| id == &version.id
+                    && project.as_ref().is_none_or(|p| p == &version.project_id))
+                && version.game_versions.contains(&item.version)
                 && version.loaders.iter().any(|v| v == target),
             "依赖与当前实例不兼容"
         );
@@ -189,12 +217,19 @@ fn install_modrinth(mods: &Path, item: &Instance, hit: &Hit, downloads: &Downloa
             ensure!(existing == version.id, "项目要求的依赖版本冲突");
             continue;
         }
-        let file = version
-            .files
-            .iter()
-            .find(|f| f.primary)
-            .or(version.files.first())
-            .context("模组版本没有文件")?;
+        let file = if let Some(pin) = pinned.filter(|f| f.id == version.id) {
+            version
+                .files
+                .iter()
+                .find(|f| f.filename == pin.filename && f.hashes.get("sha1") == Some(&pin.sha1))
+        } else {
+            version
+                .files
+                .iter()
+                .filter(|f| jar_name(&f.filename))
+                .max_by_key(|f| f.primary)
+        }
+        .context("发布文件已更改或缺少兼容的 JAR，请重新选择版本")?;
         ensure!(
             jar_name(&file.filename) && names.insert(file.filename.to_lowercase()),
             "模组文件名无效或重复"
@@ -250,7 +285,13 @@ fn install_modrinth(mods: &Path, item: &Instance, hit: &Hit, downloads: &Downloa
     Ok(())
 }
 
-fn install_curse(dir: &Path, item: &Instance, project: u64, d: &Downloads) -> Result<()> {
+fn install_curse(
+    dir: &Path,
+    item: &Instance,
+    project: u64,
+    pinned: Option<&crate::market::Release>,
+    d: &Downloads,
+) -> Result<()> {
     let mut seen = HashSet::new();
     let mut queue = vec![project];
     let mut files = vec![];
@@ -262,7 +303,17 @@ fn install_curse(dir: &Path, item: &Instance, project: u64, d: &Downloads) -> Re
         if !seen.insert(id) {
             continue;
         }
-        let mut f = crate::curse::latest_jar(id, item.loader, &item.version)?;
+        let mut f = match pinned.filter(|_| id == project) {
+            Some(file) => {
+                let f = crate::curse::pinned_jar(id, file.id.parse()?, item.loader, &item.version)?;
+                ensure!(
+                    f.name == file.filename && f.hash.eq_ignore_ascii_case(&file.sha1),
+                    "发布文件已更改，请重新选择版本"
+                );
+                f
+            }
+            None => crate::curse::latest_jar(id, item.loader, &item.version)?,
+        };
         f.name = download_name(&id.to_string(), &f.name)?;
         ensure!(
             jar_name(&f.name) && names.insert(f.name.to_lowercase()),
@@ -399,9 +450,9 @@ pub fn upgrade(
     fs::remove_file(staged.join(&u.old))?;
     let d = Downloads::new(cancel, &report)?;
     if let Some(p) = u.hit.project_id.strip_prefix("cf:") {
-        install_curse(&staged, item, p.parse()?, &d)?;
+        install_curse(&staged, item, p.parse()?, None, &d)?;
     } else {
-        install_modrinth(&staged, item, &u.hit, &d)?;
+        install_modrinth(&staged, item, &u.hit.project_id, None, &d)?;
     }
     ensure!(staged.join(&u.new).is_file(), "上游版本已更新，请重新检查");
     if u.old.ends_with(".disabled") {

@@ -1,7 +1,7 @@
 use crate::{
     download,
     library::Loader,
-    market::{Hit, Release},
+    market::{Hit, Kind, Release, Source},
     packs::PackFile,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -82,6 +82,8 @@ struct File {
     download_url: Option<String>,
     hashes: Vec<Hash>,
     #[serde(default)]
+    game_versions: Vec<String>,
+    #[serde(default)]
     dependencies: Vec<Dep>,
 }
 #[derive(Deserialize)]
@@ -117,11 +119,8 @@ impl File {
             })
     }
 }
-pub fn search(loader: Loader, mc: &str, query: &str, offset: usize) -> Result<Vec<Hit>> {
-    search_class(loader, mc, query, offset, "4471")
-}
 pub fn search_class(
-    loader: Loader,
+    loader: Option<Loader>,
     mc: &str,
     query: &str,
     offset: usize,
@@ -131,13 +130,15 @@ pub fn search_class(
     let mut request = http.get(format!("{api}/mods/search")).query(&[
         ("gameId", "432"),
         ("classId", class),
-        ("modLoaderType", loader_id(loader)?),
         ("searchFilter", query),
         ("pageSize", "10"),
         ("index", &offset.to_string()),
         ("sortField", "6"),
         ("sortOrder", "desc"),
     ]);
+    if let Some(loader) = loader {
+        request = request.query(&[("modLoaderType", loader_id(loader)?)]);
+    }
     if !mc.is_empty() {
         request = request.query(&[("gameVersion", mc)]);
     }
@@ -151,24 +152,30 @@ pub fn search_class(
         })
         .collect())
 }
-pub fn releases(loader: Loader, mc: &str, id: &str) -> Result<Vec<Release>> {
+pub fn releases(kind: Kind, loader: Option<Loader>, mc: &str, id: &str) -> Result<Vec<Release>> {
     let (http, api) = api()?;
     let id = id.parse::<u64>()?;
     let mut releases = vec![];
     let mut index = 0;
     loop {
-        let mut request = http.get(format!("{api}/mods/{id}/files")).query(&[
-            ("modLoaderType", loader_id(loader)?),
-            ("pageSize", "50"),
-            ("index", &index.to_string()),
-        ]);
+        let mut request = http
+            .get(format!("{api}/mods/{id}/files"))
+            .query(&[("pageSize", "50"), ("index", &index.to_string())]);
+        if let Some(loader) = loader {
+            request = request.query(&[("modLoaderType", loader_id(loader)?)]);
+        }
         if !mc.is_empty() {
             request = request.query(&[("gameVersion", mc)]);
         }
         let files: Vec<File> = get(request)?;
         let count = files.len();
         for f in files {
-            if f.file_name.to_ascii_lowercase().ends_with(".zip") && f.url().is_ok() {
+            if f.mod_id == id
+                && f.file_name
+                    .to_ascii_lowercase()
+                    .ends_with(kind.extension(Source::CurseForge))
+                && f.url().is_ok()
+            {
                 releases.push(Release {
                     source: crate::market::Source::CurseForge,
                     project: id.to_string(),
@@ -176,6 +183,7 @@ pub fn releases(loader: Loader, mc: &str, id: &str) -> Result<Vec<Release>> {
                     name: f.display_name.clone(),
                     url: f.url()?,
                     sha1: f.sha1()?,
+                    filename: f.file_name,
                 });
             }
         }
@@ -281,6 +289,28 @@ pub fn latest_jar(project: u64, loader: Loader, mc: &str) -> Result<Jar> {
         .into_iter()
         .find(|f| f.mod_id == project && f.file_name.to_ascii_lowercase().ends_with(".jar"))
         .context("没有兼容的 CurseForge 模组版本")?;
+    as_jar(project, f)
+}
+
+pub fn pinned_jar(project: u64, id: u64, loader: Loader, mc: &str) -> Result<Jar> {
+    let (http, api) = api()?;
+    let f: File = get(http.get(format!("{api}/mods/{project}/files/{id}")))?;
+    ensure!(
+        f.id == id
+            && f.game_versions.iter().any(|v| v == mc)
+            && f.game_versions
+                .iter()
+                .any(|v| v.eq_ignore_ascii_case(loader.label())),
+        "所选模组与目标实例不兼容"
+    );
+    as_jar(project, f)
+}
+
+fn as_jar(project: u64, f: File) -> Result<Jar> {
+    ensure!(
+        f.mod_id == project && f.file_name.to_ascii_lowercase().ends_with(".jar"),
+        "模组文件与项目不匹配"
+    );
     Ok(Jar {
         project,
         id: f.id,

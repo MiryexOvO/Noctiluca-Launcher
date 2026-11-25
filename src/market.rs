@@ -23,6 +23,50 @@ impl Source {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Mod,
+    Pack,
+    Resource,
+    Shader,
+}
+
+impl Kind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mod => "模组",
+            Self::Pack => "整合包",
+            Self::Resource => "资源包",
+            Self::Shader => "光影",
+        }
+    }
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Mod => "mod",
+            Self::Pack => "modpack",
+            Self::Resource => "resourcepack",
+            Self::Shader => "shader",
+        }
+    }
+    pub fn class(self) -> &'static str {
+        match self {
+            Self::Mod => "6",
+            Self::Pack => "4471",
+            Self::Resource => "12",
+            Self::Shader => "6552",
+        }
+    }
+    pub fn uses_loader(self) -> bool {
+        matches!(self, Self::Mod | Self::Pack)
+    }
+    pub fn extension(self, source: Source) -> &'static str {
+        match (self, source) {
+            (Self::Mod, _) => ".jar",
+            (Self::Pack, Source::Modrinth) => ".mrpack",
+            _ => ".zip",
+        }
+    }
+}
 #[derive(Clone)]
 pub struct Hit {
     pub id: String,
@@ -37,6 +81,7 @@ pub struct Release {
     pub id: String,
     pub url: String,
     pub sha1: String,
+    pub filename: String,
 }
 impl Release {
     pub fn archive(&self, root: &Path, downloads: &Downloads) -> Result<PathBuf> {
@@ -102,18 +147,20 @@ struct Hashes {
 
 pub fn search(
     source: Source,
-    loader: Loader,
+    kind: Kind,
+    loader: Option<Loader>,
     mc: &str,
     query: &str,
     offset: usize,
 ) -> Result<Vec<Hit>> {
+    let loader = loader.filter(|_| kind.uses_loader());
     if source == Source::CurseForge {
-        return crate::curse::search(loader, mc, query, offset);
+        return crate::curse::search_class(loader, mc, query, offset, kind.class());
     }
-    let mut facets = vec![
-        vec!["project_type:modpack".to_owned()],
-        vec![format!("categories:{}", slug(loader)?)],
-    ];
+    let mut facets = vec![vec![format!("project_type:{}", kind.slug())]];
+    if let Some(loader) = loader {
+        facets.push(vec![format!("categories:{}", slug(loader)?)]);
+    }
     if !mc.is_empty() {
         facets.push(vec![format!("versions:{mc}")]);
     }
@@ -139,15 +186,27 @@ pub fn search(
         .collect())
 }
 pub fn releases(source: Source, loader: Loader, mc: &str, project: &str) -> Result<Vec<Release>> {
+    files(source, Kind::Pack, Some(loader), mc, project)
+}
+
+pub fn files(
+    source: Source,
+    kind: Kind,
+    loader: Option<Loader>,
+    mc: &str,
+    project: &str,
+) -> Result<Vec<Release>> {
+    let loader = loader.filter(|_| kind.uses_loader());
     if source == Source::CurseForge {
-        return crate::curse::releases(loader, mc, project);
+        return crate::curse::releases(kind, loader, mc, project);
     }
     ensure!(safe_id(project), "项目编号无效");
-    let mut request = download::client()?
-        .get(format!(
-            "https://api.modrinth.com/v2/project/{project}/version"
-        ))
-        .query(&[("loaders", serde_json::to_string(&[slug(loader)?])?)]);
+    let mut request = download::client()?.get(format!(
+        "https://api.modrinth.com/v2/project/{project}/version"
+    ));
+    if let Some(loader) = loader {
+        request = request.query(&[("loaders", serde_json::json!([slug(loader)?]).to_string())]);
+    }
     if !mc.is_empty() {
         request = request.query(&[("game_versions", serde_json::to_string(&[mc])?)]);
     }
@@ -158,7 +217,11 @@ pub fn releases(source: Source, loader: Loader, mc: &str, project: &str) -> Resu
             let file = v
                 .files
                 .into_iter()
-                .filter(|f| f.filename.ends_with(".mrpack"))
+                .filter(|f| {
+                    f.filename
+                        .to_ascii_lowercase()
+                        .ends_with(kind.extension(source))
+                })
                 .max_by_key(|f| f.primary)?;
             Some(Release {
                 source,
@@ -167,6 +230,7 @@ pub fn releases(source: Source, loader: Loader, mc: &str, project: &str) -> Resu
                 name: format!("{} · {}", v.name, v.version_number),
                 url: file.url,
                 sha1: file.hashes.sha1,
+                filename: file.filename,
             })
         })
         .collect())
@@ -185,7 +249,7 @@ pub fn builds(loader: Loader, mc: &str) -> Result<Vec<String>> {
             .into_iter()
             .filter(|v| neoforge::latest_for_minecraft(std::slice::from_ref(v), mc).is_ok())
             .collect(),
-        Loader::Fabric => {
+        Loader::Fabric | Loader::Quilt => {
             #[derive(Deserialize)]
             struct Entry {
                 loader: Build,
@@ -194,17 +258,18 @@ pub fn builds(loader: Loader, mc: &str) -> Result<Vec<String>> {
             struct Build {
                 version: String,
             }
+            let base = if loader == Loader::Fabric {
+                "https://meta.fabricmc.net/v2"
+            } else {
+                "https://meta.quiltmc.org/v3"
+            };
             let list: Vec<Entry> = download::client()?
-                .get(format!("https://meta.fabricmc.net/v2/versions/loader/{mc}"))
+                .get(format!("{base}/versions/loader/{mc}"))
                 .send()?
                 .error_for_status()?
                 .json()?;
             list.into_iter().map(|v| v.loader.version).collect()
         }
-        Loader::Quilt => mc_launcher_core::loader::quilt::list_loader_versions()?
-            .into_iter()
-            .map(|v| v.version)
-            .collect(),
         _ => bail!("请选择支持的加载器"),
     };
     ids.retain(|v| safe_id(v));
@@ -250,77 +315,81 @@ pub fn lookup_pack_hash(hash: &str) -> Result<crate::content::Upstream> {
         release: v.id,
     })
 }
-fn resource_type(kind: &str) -> Result<&str> {
-    match kind {
-        "resourcepacks" => Ok("resourcepack"),
-        "shaderpacks" => Ok("shader"),
-        _ => bail!("不支持此资源类型"),
+fn resource_kind(folder: &str) -> Result<Kind> {
+    match folder {
+        "resourcepacks" => Ok(Kind::Resource),
+        "shaderpacks" => Ok(Kind::Shader),
+        _ => bail!("未知资源类型"),
     }
 }
-pub fn resources(kind: &str, mc: &str, q: &str) -> Result<Vec<Hit>> {
-    let filters = serde_json::json!([
-        [format!("project_type:{}", resource_type(kind)?)],
-        [format!("versions:{mc}")]
-    ])
-    .to_string();
-    let v: Search = download::client()?
-        .get("https://api.modrinth.com/v2/search")
-        .query(&[("query", q), ("facets", &filters), ("limit", "10")])
-        .send()?
-        .error_for_status()?
-        .json()?;
-    Ok(v.hits
-        .into_iter()
-        .map(|p| Hit {
-            id: p.project_id,
-            title: p.title,
-            description: p.description,
-        })
-        .collect())
+pub fn resources(folder: &str, mc: &str, query: &str) -> Result<Vec<Hit>> {
+    search(Source::Modrinth, resource_kind(folder)?, None, mc, query, 0)
 }
+
 pub fn install_resource(
     root: &Path,
     item: &crate::library::Instance,
-    kind: &str,
+    folder: &str,
     id: &str,
     cancel: &std::sync::atomic::AtomicBool,
     report: impl Fn(String) + Sync,
 ) -> Result<()> {
-    resource_type(kind)?;
-    ensure!(safe_id(id), "项目 ID 无效");
-    let _lock = crate::library::lock_instance(root, item, "请退出游戏后安装资源")?;
-    let dir = crate::content::resource_dir(root, item, kind)?;
-    let d = Downloads::new(cancel, &report)?;
-    let versions: Vec<Version> = d
-        .http
-        .get(format!("https://api.modrinth.com/v2/project/{id}/version"))
-        .query(&[(
-            "game_versions",
-            serde_json::json!([item.version]).to_string(),
-        )])
-        .send()?
-        .error_for_status()?
-        .json()?;
-    let file = versions
+    let kind = resource_kind(folder)?;
+    let release = files(Source::Modrinth, kind, None, &item.version, id)?
         .into_iter()
-        .find_map(|v| {
-            v.files
-                .into_iter()
-                .filter(|f| f.filename.to_ascii_lowercase().ends_with(".zip"))
-                .max_by_key(|f| f.primary)
-        })
+        .next()
         .ok_or_else(|| anyhow::anyhow!("没有兼容的 ZIP 资源"))?;
-    let name = crate::packs::relative(&file.filename)?;
-    ensure!(name.components().count() == 1, "文件名无效");
-    let url = url::Url::parse(&file.url)?;
+    install_file(root, item, kind, &release, cancel, report)
+}
+
+pub fn install_file(
+    root: &Path,
+    item: &crate::library::Instance,
+    kind: Kind,
+    file: &Release,
+    cancel: &std::sync::atomic::AtomicBool,
+    report: impl Fn(String) + Sync,
+) -> Result<()> {
+    let _lock = crate::library::lock_instance(root, item, "实例正在使用，请稍后重试")?;
+    let current: crate::library::Instance =
+        serde_json::from_slice(&std::fs::read(item.path(root).join("instance.json"))?)?;
     ensure!(
-        url.scheme() == "https" && url.host_str() == Some("cdn.modrinth.com"),
-        "资源下载地址无效"
+        current.id == item.id
+            && current.version == item.version
+            && current.loader == item.loader
+            && current.external == item.external,
+        "实例已变更，请重新选择目标实例"
+    );
+    let d = Downloads::new(cancel, &report)?;
+    d.check()?;
+    if kind == Kind::Mod {
+        return crate::mods::install_pinned(root, &current, file, &d);
+    }
+    let folder = match kind {
+        Kind::Resource => "resourcepacks",
+        Kind::Shader => "shaderpacks",
+        _ => bail!("请在整合包预览中安装"),
+    };
+    let dir = crate::content::resource_dir(root, &current, folder)?;
+    let name = crate::packs::relative(&file.filename)?;
+    ensure!(
+        name.components().count() == 1 && file.filename.to_ascii_lowercase().ends_with(".zip"),
+        "资源文件名无效"
+    );
+    let url = url::Url::parse(&file.url)?;
+    let trusted = match file.source {
+        Source::Modrinth => url.host_str() == Some("cdn.modrinth.com"),
+        Source::CurseForge => url.host_str().is_some_and(|h| h.ends_with(".forgecdn.net")),
+    };
+    ensure!(url.scheme() == "https" && trusted, "资源下载地址无效");
+    ensure!(
+        file.sha1.len() == 40 && file.sha1.bytes().all(|c| c.is_ascii_hexdigit()),
+        "资源缺少有效的 SHA-1"
     );
     let dest = dir.join(name);
     if dest.exists() {
         ensure!(
-            mc_launcher_core::io::hash::sha1_file(&dest)? == file.hashes.sha1,
+            mc_launcher_core::io::hash::sha1_file(&dest)?.eq_ignore_ascii_case(&file.sha1),
             "同名文件已经存在"
         );
         return Ok(());
@@ -329,10 +398,10 @@ pub fn install_resource(
         &dir,
         "安装资源",
         vec![DownloadTask {
-            url: file.url,
-            label: file.filename,
+            url: file.url.clone(),
+            label: file.filename.clone(),
             destination: dest,
-            checksum: Some(Checksum::Sha1(file.hashes.sha1)),
+            checksum: Some(Checksum::Sha1(file.sha1.clone())),
         }],
     )
 }

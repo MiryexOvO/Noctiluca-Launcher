@@ -1,4 +1,5 @@
 mod content;
+mod create;
 mod hub;
 mod instance_controls;
 mod instance_panel;
@@ -108,7 +109,7 @@ enum Update {
     PackPrefetched(Result<()>),
     PackFinished(Result<()>, Option<String>),
     Status(String),
-    Finished(Result<()>, &'static str),
+    Finished(Result<()>, String),
 }
 
 pub struct Home {
@@ -133,7 +134,7 @@ pub struct Home {
     page: Page,
     name: Entity<TextInput>,
     query: Entity<TextInput>,
-    loader: Loader,
+    wizard: create::Wizard,
     mod_query: Entity<TextInput>,
     hits: Vec<mods::Hit>,
     jars: Vec<String>,
@@ -177,10 +178,13 @@ impl Home {
         let query = cx.new(|cx| {
             TextInput::new(window, cx)
                 .label("游戏版本")
-                .placeholder("输入版本号，例如 1.20.1")
+                .placeholder("搜索游戏版本，例如 1.20.1")
                 .max_len(80)
         });
-        let subscription = cx.observe(&query, |_, _, cx| cx.notify());
+        let subscription = cx.observe(&query, |home: &mut Self, field, cx| {
+            let filter = field.read(cx).text().trim().to_ascii_lowercase();
+            home.filter_versions(filter, cx);
+        });
         let mod_query = cx.new(|cx| {
             TextInput::new(window, cx)
                 .label("搜索内容")
@@ -219,7 +223,7 @@ impl Home {
             page: initial_page,
             name,
             query,
-            loader: Loader::Vanilla,
+            wizard: Default::default(),
             mod_query,
             hits: Vec::new(),
             jars: Vec::new(),
@@ -299,7 +303,11 @@ impl Home {
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
         self.failed = false;
-        self.status = "正在准备启动".into();
+        self.status = if install_only {
+            format!("正在安装「{}」", self.instances[self.selected].name)
+        } else {
+            "正在准备启动".into()
+        };
         let root = self.root.clone();
         let instance = self.instances[self.selected].clone();
         self.outcomes.remove(&instance.id);
@@ -324,7 +332,7 @@ impl Home {
                 },
             );
             let _ = tx.try_send(if install_only {
-                Update::Finished(result, "安装与校验完成")
+                Update::Finished(result, format!("「{}」安装与校验完成", instance.name))
             } else {
                 Update::Exited(instance.id, result)
             });
@@ -410,11 +418,10 @@ impl Home {
                             }
                             Update::Finished(result, success) => {
                                 home.cancel = None;
-                                home.status = success.into();
                                 if home.page == Page::Files && result.is_ok() {
                                     home.browse_files(home.content.label, home.content.kind, cx);
-                                    home.status = success.into();
                                 }
+                                home.status = success;
                                 if matches!(home.page, Page::Mods) {
                                     home.refresh_mods(cx);
                                 }
@@ -475,6 +482,7 @@ impl Home {
                             }
                         }
                         home.versions = versions;
+                        home.sync_game_choice(cx);
                     }
                     Err(e) => home.message(Err(e), cx),
                 }
@@ -482,26 +490,6 @@ impl Home {
             });
         })
         .detach();
-    }
-
-    fn create(&mut self, cx: &mut Context<Self>) -> Result<()> {
-        let version = self.query.read(cx).text().trim().to_owned();
-        if !self.versions.is_empty() {
-            ensure!(
-                self.versions.iter().any(|v| v.id == version),
-                "请从官方列表选择有效的游戏版本"
-            );
-        }
-        let item = Instance::new(self.name.read(cx).text().into(), version, self.loader)?;
-        library::save(&self.root, &item)?;
-        self.instances.push(item);
-        if crate::preferences::current().select_new || self.instances.len() == 1 {
-            self.selected = self.instances.len() - 1;
-        }
-        self.page = Page::Detail;
-        self.status = "实例已创建".into();
-        self.failed = false;
-        Ok(())
     }
 
     fn open(&mut self, relative: &str, cx: &mut Context<Self>) {
@@ -659,15 +647,15 @@ impl Home {
                     })),
             )
             .child(
-                Button::new("downloads", "下载中心")
+                Button::new("downloads", "发现内容")
                     .full_width()
                     .when(matches!(self.page, Page::Hub), |b| b.primary())
                     .disabled(busy)
                     .on_click(cx.listener(|home, _, _, cx| {
                         home.page = Page::Hub;
-                        home.failed = false;
-                        home.status = "就绪".into();
-                        home.fetch_versions(false, cx);
+                        if !home.hub.searched && !home.hub.loading {
+                            home.discover(0, false, cx);
+                        }
                         cx.notify();
                     })),
             )
@@ -1018,14 +1006,16 @@ impl Home {
         let query = self.mod_query.read(cx).text().to_owned();
         let task = cx.background_executor().spawn(async move {
             if curse {
-                crate::curse::search_class(item.loader, &item.version, &query, 0, "6").map(|v| {
-                    v.into_iter()
-                        .map(|h| mods::Hit {
-                            project_id: format!("cf:{}", h.id),
-                            title: h.title,
-                        })
-                        .collect()
-                })
+                crate::curse::search_class(Some(item.loader), &item.version, &query, 0, "6").map(
+                    |v| {
+                        v.into_iter()
+                            .map(|h| mods::Hit {
+                                project_id: format!("cf:{}", h.id),
+                                title: h.title,
+                            })
+                            .collect()
+                    },
+                )
             } else {
                 mods::search(&item, &query)
             }
@@ -1065,7 +1055,7 @@ impl Home {
             let result = mods::install(&root, &item, &hit, &cancel, |s| {
                 let _ = tx.try_send(Update::Status(s));
             });
-            let _ = tx.try_send(Update::Finished(result, "模组与必需依赖已安装"));
+            let _ = tx.try_send(Update::Finished(result, "模组与必需依赖已安装".into()));
         });
         self.listen(rx, cx);
     }
@@ -1112,7 +1102,7 @@ impl Home {
             let result = mods::upgrade(&root, &item, &u, &cancel, |s| {
                 let _ = tx.try_send(Update::Status(s));
             });
-            let _ = tx.try_send(Update::Finished(result, "模组更新完成"));
+            let _ = tx.try_send(Update::Finished(result, "模组更新完成".into()));
         });
         self.listen(rx, cx);
     }
@@ -1268,112 +1258,6 @@ impl Home {
         })
         .detach();
     }
-
-    fn form(&self, cx: &Context<Self>) -> impl IntoElement {
-        let mut loaders = div().flex().gap_2();
-        for (idx, loader) in [
-            Loader::Vanilla,
-            Loader::Fabric,
-            Loader::Quilt,
-            Loader::Forge,
-            Loader::NeoForge,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            if loader == Loader::Quilt && crate::preferences::current().hide_quilt {
-                continue;
-            }
-            loaders = loaders.child(
-                Button::new(("loader", idx), loader.label())
-                    .when(loader == self.loader, |b| b.primary())
-                    .on_click(cx.listener(move |home, _, _, cx| {
-                        home.loader = loader;
-                        cx.notify();
-                    })),
-            );
-        }
-        let filter = self.query.read(cx).text().trim().to_ascii_lowercase();
-        let mut matches = div().flex().flex_wrap().gap_1();
-        for (idx, entry) in self
-            .versions
-            .iter()
-            .filter(|v| {
-                if filter.is_empty() {
-                    v.kind == "release"
-                } else {
-                    v.id.to_ascii_lowercase().contains(&filter)
-                }
-            })
-            .take(6)
-            .enumerate()
-        {
-            let value = entry.id.clone();
-            matches = matches.child(Button::new(("version", idx), value.clone()).on_click(
-                cx.listener(move |home, _, _, cx| {
-                    home.query
-                        .update(cx, |field, cx| field.set_text(value.clone(), cx));
-                }),
-            ));
-        }
-        div()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(heading("新建实例"))
-                    .child(
-                        Button::new(
-                            "import-pack",
-                            if self.draft.is_some() {
-                                "继续导入整合包"
-                            } else {
-                                "导入整合包"
-                            },
-                        )
-                        .on_click(cx.listener(|home, _, _, cx| home.import_pack(cx))),
-                    ),
-            )
-            .child(kicker("实例名称"))
-            .child(Input::new(&self.name))
-            .child(kicker("游戏版本"))
-            .child(Input::new(&self.query))
-            .child(matches)
-            .child(kicker("加载器"))
-            .child(loaders)
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        Button::new("create", "创建实例")
-                            .primary()
-                            .on_click(cx.listener(|home, _, _, cx| {
-                                let result = home.create(cx);
-                                home.message(result, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new(
-                            "refresh",
-                            if self.fetching {
-                                "正在获取版本"
-                            } else {
-                                "刷新官方版本"
-                            },
-                        )
-                        .disabled(self.fetching)
-                        .on_click(cx.listener(|home, _, _, cx| {
-                            home.fetch_versions(true, cx);
-                            cx.notify();
-                        })),
-                    ),
-            )
-    }
 }
 
 fn kicker(text: &str) -> Div {
@@ -1421,7 +1305,7 @@ impl Render for Home {
             motion::Destination {
                 page: self.page,
                 instance: self.selected,
-                packs: matches!(self.page, Page::Hub) && self.hub.packs,
+                packs: matches!(self.page, Page::Hub) && self.hub.is_pack(),
             },
             cx.theme().reduced_motion,
             std::time::Instant::now(),
@@ -1438,7 +1322,7 @@ impl Render for Home {
             Page::Detail => self
                 .detail(frame, window.viewport_size().width >= px(920.), cx)
                 .into_any_element(),
-            Page::Create => self.form(cx).into_any_element(),
+            Page::Create => self.form(window, cx).into_any_element(),
             Page::Accounts => self.account_page(cx).into_any_element(),
             Page::Mods => self.mods_page(cx).into_any_element(),
             Page::Console => self.console_page(cx).into_any_element(),
