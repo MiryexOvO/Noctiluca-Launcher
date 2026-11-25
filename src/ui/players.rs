@@ -228,7 +228,7 @@ impl Home {
         self.profiles.rename = false;
         self.profiles.add = self.accounts.players.is_empty();
         self.profiles.client = match accounts::client_id(&self.root) {
-            Ok(client) => client,
+            Ok(client) => Some(client),
             Err(e) => {
                 self.message(Err(e), cx);
                 None
@@ -470,7 +470,7 @@ impl Home {
                     form = form.child(kicker(if self.profiles.client.is_some() {
                         "使用一次性代码在微软官方页面授权，也可以用手机完成。"
                     } else {
-                        "此版本尚未开通微软登录服务，暂时无法获取登录代码。"
+                        "微软登录配置读取失败。请查看下方的错误信息。"
                     }));
                 }
                 Kind::Offline => {

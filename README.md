@@ -46,7 +46,7 @@ Noctiluca-data/
 - **Microsoft** 点击「微软正版登录」。Noctiluca 会显示并复制一次性代码，自动打开微软验证页。也可以在手机上打开弹窗里的网址完成授权。成功后自动显示 Java 角色，刷新令牌存放在 Windows 凭据管理器。
 - **第三方** 填写认证站提供的 Yggdrasil HTTPS API 根地址和该站账号。多角色账号可指定角色名。游戏使用与该站配套的 authlib-injector 登录。[authlib-injector 项目](https://github.com/yushijinhun/authlib-injector)
 
-发布者可在构建时通过 `NOCTILUCA_CLIENT_ID` 提供 Noctiluca 的公开客户端 ID。应用需支持个人微软账号、启用公共客户端设备代码流，并具备 Minecraft 服务访问权限。玩家可直接使用已配置的发布版。旧版保存的服务配置继续生效。[微软设备代码协议](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code)
+启动器默认使用 Noctiluca Launcher 的公开客户端 ID。使用自有应用构建时，可通过 `NOCTILUCA_CLIENT_ID` 覆盖。旧版保存的服务配置继续生效。应用需支持个人微软账号、启用公共客户端流，并具备 Minecraft 服务访问权限。[微软设备代码协议](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code)
 
 ## 从源码构建
 

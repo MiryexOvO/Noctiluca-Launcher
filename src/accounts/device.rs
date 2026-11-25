@@ -36,6 +36,8 @@ struct Challenge {
 #[derive(Deserialize)]
 struct OAuthError {
     error: String,
+    #[serde(default)]
+    error_codes: Vec<u32>,
 }
 
 fn check_cancel(cancel: &AtomicBool) -> Result<()> {
@@ -128,11 +130,15 @@ fn authorize_with(
         .form(&[("client_id", client_id), ("scope", SCOPE)])
         .send()
         .context("无法连接微软登录服务")?;
-    ensure!(
-        response.status().is_success(),
-        "微软未能签发设备代码（HTTP {}），请检查发布应用的公共客户端配置",
-        response.status()
-    );
+    let status = response.status();
+    if !status.is_success() {
+        if let Ok(error) = response.json::<OAuthError>()
+            && let Some(code) = error.error_codes.first()
+        {
+            bail!("微软未能签发设备代码（AADSTS{code}）。请联系启动器发布者检查公共客户端配置");
+        }
+        bail!("微软未能签发设备代码（HTTP {status}），请稍后重试");
+    }
     let challenge: Challenge = response.json().context("微软返回的设备代码无效")?;
     ensure!(
         !challenge.device_code.is_empty()

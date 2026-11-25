@@ -162,18 +162,20 @@ fn normalize_client(value: &str) -> Result<String> {
     Ok(id.to_string())
 }
 
-pub fn client_id(root: &Path) -> Result<Option<String>> {
+const NOCTILUCA_CLIENT_ID: &str = "3f742017-a1c2-4529-b56b-70fa0127efcf";
+
+pub fn client_id(root: &Path) -> Result<String> {
     if let Some(id) = option_env!("NOCTILUCA_CLIENT_ID") {
-        return normalize_client(id).map(Some);
+        return normalize_client(id);
     }
     if let Some(id) = crate::setting("CLIENT_ID") {
-        return normalize_client(id.to_str().context("微软登录服务配置无效")?).map(Some);
+        return normalize_client(id.to_str().context("微软登录服务配置无效")?);
     }
     match fs::read(root.join("microsoft-client.json")) {
-        Ok(data) => Ok(Some(normalize_client(
+        Ok(data) => normalize_client(
             &serde_json::from_slice::<String>(&data).context("微软登录服务配置无效")?,
-        )?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(NOCTILUCA_CLIENT_ID.to_owned()),
         Err(e) => Err(e.into()),
     }
 }
