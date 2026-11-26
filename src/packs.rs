@@ -611,6 +611,9 @@ impl Preview {
             }
         }
         downloads.check()?;
+        if let Some(icon) = crate::instance_icon::from_archive(&mut zip) {
+            fs::write(temp.path().join(crate::instance_icon::FILENAME), icon)?;
+        }
         let mut state =
             crate::content::PackState::from_game(&game, self.upstream.clone(), &instance.name)?;
         state.archive_sha1 = self.archive_sha1.clone();

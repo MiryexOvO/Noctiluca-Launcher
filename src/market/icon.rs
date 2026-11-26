@@ -27,9 +27,12 @@ fn thumbnail(bytes: Vec<u8>) -> Result<Vec<u8>> {
     reader.limits(limits);
     let image = reader.decode()?;
     let mut output = Cursor::new(Vec::new());
-    image
-        .thumbnail(THUMBNAIL, THUMBNAIL)
-        .write_to(&mut output, ImageFormat::Png)?;
+    let thumb = if image.width().max(image.height()) > THUMBNAIL {
+        image.thumbnail(THUMBNAIL, THUMBNAIL)
+    } else {
+        image
+    };
+    thumb.write_to(&mut output, ImageFormat::Png)?;
     Ok(output.into_inner())
 }
 
@@ -41,6 +44,13 @@ fn is_image_cdn(url: &Url) -> bool {
         && url.host_str().is_some_and(|h| {
             matches!(h, "cdn.modrinth.com" | "cdn-raw.modrinth.com") || h.ends_with(".forgecdn.net")
         })
+}
+
+pub(crate) fn read_thumbnail(input: impl Read) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    input.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= MAX_BYTES, "资源图标过大");
+    thumbnail(bytes)
 }
 
 pub fn cached(root: &Path, address: &str) -> Result<PathBuf> {
@@ -71,9 +81,6 @@ pub fn cached(root: &Path, address: &str) -> Result<PathBuf> {
         response.status().is_success() && response.content_length().is_none_or(|n| n <= MAX_BYTES),
         "资源图标不可用"
     );
-    let mut bytes = Vec::new();
-    response.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() as u64 <= MAX_BYTES, "资源图标过大");
-    crate::library::atomic_write(&path, &thumbnail(bytes)?)?;
+    crate::library::atomic_write(&path, &read_thumbnail(response)?)?;
     Ok(path)
 }

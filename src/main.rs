@@ -9,6 +9,7 @@ mod download;
 mod folders;
 mod forge;
 mod game;
+mod instance_icon;
 mod java;
 mod library;
 mod logs;

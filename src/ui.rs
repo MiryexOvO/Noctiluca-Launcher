@@ -345,6 +345,7 @@ impl Home {
                                 home.content.builds.clear();
                             }
                             Update::Imported(item) => {
+                                home.refresh_instance_icon(&item.id, cx);
                                 home.draft = None;
                                 if let Some(i) = home.instances.iter().position(|x| x.id == item.id)
                                 {
@@ -460,7 +461,16 @@ impl Home {
         self.message(result, cx)
     }
 
-    fn sidebar(&self, frame: motion::Frame, cx: &Context<Self>) -> impl IntoElement {
+    fn refresh_instance_icon(&self, id: &str, cx: &mut App) {
+        cx.remove_asset::<project_icon::InstanceIcon>(&(self.root.clone(), id.to_owned()));
+    }
+
+    fn sidebar(
+        &self,
+        frame: motion::Frame,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let busy = self.cancel.is_some() || self.searching || self.logging_in || self.copying;
         let accent = cx.theme().colors.accent;
         let mut list = div()
@@ -496,6 +506,9 @@ impl Home {
             });
         for (idx, item) in self.instances.iter().enumerate() {
             let selected = idx == self.selected && matches!(self.page, Page::Detail);
+            let image = window
+                .use_asset::<project_icon::InstanceIcon>(&(self.root.clone(), item.id.clone()), cx)
+                .flatten();
             list = list.child(
                 div()
                     .id(("instance", idx))
@@ -509,18 +522,29 @@ impl Home {
                     .gap_3()
                     .when(!selected, |el| el.hover(|s| s.bg(accent.opacity(0.09))))
                     .cursor_pointer()
-                    .child(Icon::new(IconName::Box).color(if selected {
-                        accent
-                    } else {
-                        cx.theme().colors.fg_muted
-                    }))
+                    .child(project_icon::instance_tile(
+                        image,
+                        if selected {
+                            accent
+                        } else {
+                            cx.theme().colors.fg_muted
+                        },
+                    ))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(div().truncate().child(item.name.clone()))
+                            .child(
+                                div()
+                                    .id(("instance-name", idx))
+                                    .truncate()
+                                    .tooltip(ely_gpui_component::primitives::Tooltip::text(
+                                        item.name.clone(),
+                                    ))
+                                    .child(item.name.clone()),
+                            )
                             .child(
                                 div()
                                     .text_xs()
@@ -1341,7 +1365,7 @@ impl Render for Home {
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.sidebar(frame, cx))
+                    .child(self.sidebar(frame, window, cx))
                     .child(
                         div()
                             .flex_1()

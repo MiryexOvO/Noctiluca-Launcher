@@ -163,15 +163,20 @@ pub fn search_class(
     let projects: Vec<Project> = get(request)?;
     Ok(projects.into_iter().map(|p| p.into_hit(class)).collect())
 }
+impl Logo {
+    fn address(self) -> Option<String> {
+        self.thumbnail_url
+            .filter(|url| !url.trim().is_empty())
+            .or(self.url)
+    }
+}
 impl Project {
     fn into_hit(self, class: &str) -> Hit {
         Hit {
             id: self.id.to_string(),
             title: self.name,
             description: self.summary,
-            icon_url: self
-                .logo
-                .and_then(|l| l.thumbnail_url.filter(|u| !u.trim().is_empty()).or(l.url)),
+            icon_url: self.logo.and_then(Logo::address),
             reference_version: None,
             reference_size: self
                 .latest_files
@@ -188,6 +193,15 @@ impl Project {
         }
     }
 }
+pub(crate) fn project_icon(project: &str) -> Result<Option<String>> {
+    let id: u64 = project.parse()?;
+    let (http, api) = api()?;
+    let p: Project = get(http
+        .get(format!("{api}/mods/{id}"))
+        .timeout(std::time::Duration::from_secs(8)))?;
+    Ok(p.logo.and_then(Logo::address))
+}
+
 pub fn releases(
     kind: Kind,
     loader: Option<Loader>,

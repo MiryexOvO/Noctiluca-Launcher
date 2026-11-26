@@ -367,6 +367,7 @@ pub fn lookup_pack_hash(hash: &str) -> Result<crate::content::Upstream> {
     let v: Match = resp.error_for_status()?.json()?;
     Ok(crate::content::Upstream {
         source: Source::Modrinth,
+        icon_url: None,
         project: v.project_id,
         release: v.id,
     })

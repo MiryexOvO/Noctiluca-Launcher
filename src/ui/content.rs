@@ -458,6 +458,7 @@ impl Home {
                 h.copying = false;
                 match result {
                     Ok(item) => {
+                        h.refresh_instance_icon(&item.id, cx);
                         if let Some(v) = h.instances.iter_mut().find(|v| v.id == item.id) {
                             *v = item;
                         }

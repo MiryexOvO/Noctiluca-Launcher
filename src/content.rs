@@ -59,6 +59,8 @@ pub struct Upstream {
     pub source: crate::market::Source,
     pub project: String,
     pub release: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_url: Option<String>,
 }
 impl From<&crate::market::Release> for Upstream {
     fn from(r: &crate::market::Release) -> Self {
@@ -66,6 +68,7 @@ impl From<&crate::market::Release> for Upstream {
             source: r.source,
             project: r.project.clone(),
             release: r.id.clone(),
+            icon_url: None,
         }
     }
 }
@@ -239,6 +242,13 @@ pub fn apply_pack(
     updated.loader = new.loader;
     updated.version = new.version.clone();
     updated.loader_version = new.loader_version.clone();
+    let icon = tmp.path().join(crate::instance_icon::FILENAME);
+    let source_icon = source.join(crate::instance_icon::FILENAME);
+    if source_icon.is_file() {
+        fs::copy(source_icon, &icon)?;
+    } else if icon.try_exists()? {
+        fs::remove_file(icon)?;
+    }
     let pin = tmp.path().join("loader.json");
     if source.join("loader.json").is_file() {
         fs::copy(source.join("loader.json"), &pin)?;

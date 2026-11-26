@@ -290,6 +290,7 @@ impl Home {
             library::move_instance(&self.root, id, restore).and_then(|_| library::load(&self.root));
         match r {
             Ok(v) => {
+                self.refresh_instance_icon(id, cx);
                 self.instances = v;
                 self.selected = self.instances.iter().position(|i| i.id == id).unwrap_or(0);
                 self.page = Page::Library;

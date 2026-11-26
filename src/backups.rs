@@ -69,6 +69,9 @@ fn snapshot(
     let temp = tempfile::tempdir_in(root)?;
     if let Some(link) = external {
         let game = link.game_dir()?;
+        if let Some(icon) = crate::instance_icon::installed_icon(&game, Some(link)) {
+            fs::write(temp.path().join(crate::instance_icon::FILENAME), icon)?;
+        }
         let contents = temp.path().join("game");
         fs::create_dir(&contents)?;
         for part in crate::folders::CONTENT {
@@ -85,7 +88,12 @@ fn snapshot(
             }
         }
     } else {
-        for part in ["game", "loader.json", "pack-state.json"] {
+        for part in [
+            "game",
+            "loader.json",
+            "pack-state.json",
+            crate::instance_icon::FILENAME,
+        ] {
             let src = source.join(part);
             if src.try_exists()? {
                 copy_tree(&src, &temp.path().join(part))?;

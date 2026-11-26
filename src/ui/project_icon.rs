@@ -2,6 +2,38 @@ use super::*;
 use crate::market::{self, Kind};
 use std::path::Path;
 
+pub(super) struct InstanceIcon;
+impl Asset for InstanceIcon {
+    type Source = (PathBuf, String);
+    type Output = Option<Arc<Image>>;
+
+    fn load(
+        source: Self::Source,
+        _: &mut App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        let (root, id) = source;
+        async move {
+            let bytes = crate::instance_icon::load(&root, &id)?;
+            Some(Arc::new(Image::from_bytes(ImageFormat::Png, bytes)))
+        }
+    }
+}
+
+pub(super) fn instance_tile(image: Option<Arc<Image>>, tint: Hsla) -> Div {
+    let tile = div()
+        .size(px(28.))
+        .flex_none()
+        .rounded_md()
+        .overflow_hidden()
+        .flex()
+        .items_center()
+        .justify_center();
+    match image {
+        Some(image) => tile.child(img(image).size_full().object_fit(ObjectFit::Contain)),
+        None => tile.child(Icon::new(IconName::Box).color(tint)),
+    }
+}
+
 struct IconFile;
 impl Asset for IconFile {
     type Source = (PathBuf, String);

@@ -150,6 +150,15 @@ impl Home {
         if self.cancel.is_some() || self.copying || self.logging_in {
             return;
         }
+        let project_icon = match &pack {
+            Pack::Online(file) => self
+                .hub
+                .project
+                .as_ref()
+                .filter(|p| file.source == self.hub.source && p.id == file.project)
+                .and_then(|p| p.icon_url.clone()),
+            _ => None,
+        };
         self.draft = None;
         let root = self.root.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -177,10 +186,14 @@ impl Home {
                 };
                 let (path, upstream) = match file {
                     Ok(path) => (path, None),
-                    Err(file) => (
-                        file.archive(&root, &Downloads::new(&cancel, &report)?)?,
-                        Some(crate::content::Upstream::from(&file)),
-                    ),
+                    Err(file) => {
+                        let mut origin = crate::content::Upstream::from(&file);
+                        origin.icon_url = project_icon;
+                        (
+                            file.archive(&root, &Downloads::new(&cancel, &report)?)?,
+                            Some(origin),
+                        )
+                    }
                 };
                 let mut preview = crate::packs::preview(&root, &path)?;
                 preview.upstream = upstream.or(retry_origin);
