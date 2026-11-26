@@ -105,11 +105,14 @@ impl Catalog {
         }
     }
     pub fn scan(&self, game: &Path) -> Result<Vec<LocalFile>> {
-        let (folder, ext) = match self.kind {
-            Kind::Mod => ("mods", ".jar"),
-            Kind::Resource => ("resourcepacks", ".zip"),
-            Kind::Shader => ("shaderpacks", ".zip"),
-            Kind::Pack => anyhow::bail!("整合包使用独立实例"),
+        let folder = self
+            .kind
+            .content_folder()
+            .ok_or_else(|| anyhow::anyhow!("整合包使用独立实例"))?;
+        let ext = if self.kind == Kind::Mod {
+            ".jar"
+        } else {
+            ".zip"
         };
         let mut found = Vec::new();
         let entries = match fs::read_dir(game.join(folder)) {
@@ -189,4 +192,42 @@ impl Catalog {
             })
             .collect()
     }
+}
+
+// A resource folder can be a junction, or may first be created at install time.
+fn directory_identity(path: &Path) -> Option<(same_file::Handle, Vec<std::ffi::OsString>)> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match fs::metadata(ancestor) {
+            Ok(meta) if meta.is_dir() => {
+                return Some((same_file::Handle::from_path(ancestor).ok()?, missing));
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                missing.push(ancestor.file_name()?.to_owned());
+                ancestor = ancestor.parent()?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+pub fn sharing_folder(
+    root: &Path,
+    items: &[Instance],
+    target: &Instance,
+    kind: Kind,
+) -> Vec<String> {
+    let Some(folder) = kind.content_folder() else {
+        return Vec::new();
+    };
+    let identity = |item: &Instance| directory_identity(&item.game_dir(root).ok()?.join(folder));
+    let Some(chosen) = identity(target) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|item| item.id != target.id && identity(item).as_ref() == Some(&chosen))
+        .map(|item| item.name.clone())
+        .collect()
 }

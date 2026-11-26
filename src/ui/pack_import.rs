@@ -4,7 +4,15 @@ use ely_gpui_component::{buttons::ButtonVariant, forms::Checkbox, primitives::To
 use std::collections::HashSet;
 use std::path::Path;
 
+enum FileSelection {
+    One(usize),
+    Many,
+    Folder,
+}
+
 pub(super) struct Draft {
+    queue_drops: bool,
+    queued_paths: Vec<PathBuf>,
     pack: Arc<Preview>,
     path: PathBuf,
     optional: HashSet<usize>,
@@ -26,17 +34,32 @@ impl Draft {
 
 impl Home {
     pub(super) fn drop_pack(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        if self.page == Page::Import
+            && let Some(d) = &mut self.draft
+            && d.queue_drops
+        {
+            d.queued_paths.extend_from_slice(paths);
+            self.status = "已收到拖入的文件，当前操作结束后会继续处理".into();
+            cx.notify();
+            return;
+        }
         if self.cancel.is_some() || self.logging_in || self.copying {
             return;
         }
-        if let [path] = paths
-            && path.is_file()
-            && path
-                .extension()
-                .and_then(|v| v.to_str())
-                .is_some_and(|v| v.eq_ignore_ascii_case("zip") || v.eq_ignore_ascii_case("mrpack"))
-        {
-            self.install_pack(hub::Pack::Dropped(path.clone()), cx);
+        let archive = match paths {
+            [path] if path.is_file() => path.extension().and_then(|ext| ext.to_str()),
+            _ => None,
+        };
+        let new_mrpack = archive.is_some_and(|ext| ext.eq_ignore_ascii_case("mrpack"));
+        if self.page == Page::Import && self.draft.is_some() && !new_mrpack {
+            self.match_files(paths.to_vec(), true, cx);
+            return;
+        }
+        if new_mrpack || archive.is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
+            self.install_pack(hub::Pack::Dropped(paths[0].clone()), cx);
         } else {
             self.message(
                 Err(anyhow::anyhow!("请每次拖入一个 .mrpack 或 .zip 整合包")),
@@ -60,6 +83,8 @@ impl Home {
                     HashSet::new()
                 };
                 self.draft = Some(Draft {
+                    queue_drops: false,
+                    queued_paths: Vec::new(),
                     pack: Arc::from(pack),
                     path,
                     optional: selected,
@@ -90,6 +115,7 @@ impl Home {
                         .any(|f| !f.optional() && f.automatic.is_some())
                 {
                     let pack = draft.pack.clone();
+                    self.draft.as_mut().unwrap().queue_drops = true;
                     let cancel = Arc::new(AtomicBool::new(false));
                     self.cancel = Some(cancel.clone());
                     self.status = "正在预下载整合包必需文件".into();
@@ -187,40 +213,160 @@ impl Home {
         }
     }
 
-    fn pick_dependency(&mut self, i: usize, cx: &mut Context<Self>) {
+    pub(super) fn finish_prefetch(&mut self, result: Result<()>, cx: &mut Context<Self>) {
+        let cancelled = self
+            .cancel
+            .take()
+            .is_some_and(|c| c.load(Ordering::Relaxed));
+        match result {
+            Ok(()) => {
+                self.failed = false;
+                self.status = "可自动下载的必需文件已就绪".into();
+            }
+            Err(e) => self.pack_finished(Err(e), None, cx),
+        }
+        self.next_drop(cancelled, cx);
+    }
+
+    fn next_drop(&mut self, cancelled: bool, cx: &mut Context<Self>) {
+        if let Some(d) = &mut self.draft {
+            d.queue_drops = false;
+            let paths = std::mem::take(&mut d.queued_paths);
+            if !cancelled && !paths.is_empty() && self.page == Page::Import {
+                self.drop_pack(&paths, cx);
+            }
+        }
+    }
+
+    fn pick_files(&mut self, selection: FileSelection, cx: &mut Context<Self>) {
         let Some(draft) = &self.draft else {
             return;
         };
         let pack = draft.pack.clone();
+        let folder = matches!(selection, FileSelection::Folder);
         let pick = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("选择与整合包清单匹配的文件".into()),
+            files: !folder,
+            directories: folder,
+            multiple: matches!(selection, FileSelection::Many),
+            prompt: Some(
+                match selection {
+                    FileSelection::One(_) => "选择与整合包清单匹配的文件",
+                    FileSelection::Many => "选择已下载的文件",
+                    FileSelection::Folder => "选择要扫描的文件夹",
+                }
+                .into(),
+            ),
         });
         cx.spawn(async move |view, cx| {
-            let choice = pick.await;
+            let result = pick.await;
             let _ = view.update(cx, |home, cx| {
                 if home.cancel.is_some()
+                    || home.page != Page::Import
                     || !home
                         .draft
                         .as_ref()
-                        .is_some_and(|d| Arc::ptr_eq(&pack, &d.pack))
+                        .is_some_and(|d| Arc::ptr_eq(&d.pack, &pack))
                 {
                     return;
                 }
-                match choice {
-                    Ok(Ok(Some(paths))) => {
-                        if let Some(path) = paths.into_iter().next() {
-                            home.supply_file(pack, i, path, cx);
+                match result {
+                    Ok(Ok(Some(paths))) => match selection {
+                        FileSelection::One(i) => {
+                            if let Some(path) = paths.into_iter().next() {
+                                home.supply_file(pack, i, path, cx);
+                            }
                         }
-                    }
-                    Ok(Err(err)) => home.message(Err(err), cx),
+                        _ => home.match_files(paths, false, cx),
+                    },
+                    Ok(Err(e)) => home.message(Err(e), cx),
                     _ => {}
                 }
             });
         })
         .detach();
+    }
+
+    fn match_files(&mut self, paths: Vec<PathBuf>, dropped: bool, cx: &mut Context<Self>) {
+        if self.cancel.is_some() || paths.is_empty() {
+            return;
+        }
+        let Some(draft) = &mut self.draft else {
+            return;
+        };
+        let pack = draft.pack.clone();
+        let optional = draft.optional.clone();
+        draft.queue_drops = true;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
+        self.failed = false;
+        self.status = "正在按整合包清单匹配本地文件…".into();
+        let task = cx.background_executor().spawn(async move {
+            let result = pack.supply_batch(&paths, &optional, &cancel);
+            let cancelled = cancel.load(Ordering::Relaxed);
+            let archive = match paths.as_slice() {
+                [p] if dropped
+                    && !cancelled
+                    && result.matched.is_empty()
+                    && p.extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+                    && crate::packs::is_pack_archive(p) =>
+                {
+                    Some(p.clone())
+                }
+                _ => None,
+            };
+            (pack, result, cancelled, archive)
+        });
+        cx.spawn(async move |view, cx| {
+            let (pack, result, cancelled, archive) = task.await;
+            let _ = view.update(cx, |home, cx| {
+                // A cancellation can arrive after the worker finishes reading.
+                let cancelled = cancelled
+                    || home
+                        .cancel
+                        .as_ref()
+                        .is_some_and(|c| c.load(Ordering::Relaxed));
+                home.cancel = None;
+                let Some(draft) = home.draft.as_mut().filter(|d| Arc::ptr_eq(&d.pack, &pack))
+                else {
+                    return;
+                };
+                if let Some(path) = archive
+                    && !cancelled
+                {
+                    home.install_pack(hub::Pack::Dropped(path), cx);
+                    return;
+                }
+                let count = result.matched.len();
+                draft.supplied.extend(result.matched);
+                if draft
+                    .failed_file
+                    .is_some_and(|i| draft.supplied.contains(&i))
+                {
+                    draft.failed_file = None;
+                }
+                draft.missing_page = 0;
+                let pending = (0..pack.files.len())
+                    .filter(|&i| {
+                        draft.missing(i) || (draft.selected(i) && draft.failed_file == Some(i))
+                    })
+                    .count();
+                home.status = format!(
+                    "{}已匹配 {count} 个清单文件，还需手动补齐 {pending} 个",
+                    if cancelled { "已取消扫描 · " } else { "" }
+                );
+                if let Some(e) = result.first_error {
+                    home.status
+                        .push_str(&format!(" · {} 项读取或校验失败：{e}", result.errors));
+                }
+                home.failed = result.errors > 0;
+                home.next_drop(cancelled, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn supply_file(&mut self, pack: Arc<Preview>, i: usize, path: PathBuf, cx: &mut Context<Self>) {
@@ -326,6 +472,32 @@ impl Home {
                     estimate.unknown_count
                 )));
             }
+            if estimate.pending_count > 0 && pack.metadata_error.is_none() {
+                transfer = transfer
+                    .child(kicker(
+                        "把已下载的文件拖到这里，或扫描整个文件夹（含子文件夹）。",
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                Button::new("supply-many", "选择多个文件")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|h, _, _, cx| {
+                                        h.pick_files(FileSelection::Many, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("supply-folder", "扫描文件夹")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|h, _, _, cx| {
+                                        h.pick_files(FileSelection::Folder, cx)
+                                    })),
+                            ),
+                    );
+            }
             body = body.child(transfer.child(kicker(
                 "按当前选中的清单文件统计。基础游戏、加载器和 Java 在安装时单独检查。",
             )));
@@ -381,24 +553,9 @@ impl Home {
                 } else if pack.optional_count > 0 {
                     body = body.child(self.optional_files(draft, busy, cx));
                 }
-                if let Some(&i) = visible_missing.first() {
-                    let path = pack.files[i].path.clone();
-                    footer = footer
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_sm()
-                                .text_color(rgb(MUTED))
-                                .truncate()
-                                .child(format!("待补齐  ·  {path}")),
-                        )
-                        .child(
-                            Button::new("next-manual-file", "选择已下载文件")
-                                .primary()
-                                .disabled(busy)
-                                .on_click(cx.listener(move |h, _, _, cx| h.pick_dependency(i, cx))),
-                        );
+                if !missing.is_empty() {
+                    footer =
+                        footer.child(kicker(&format!("还需手动补齐 {} 个文件", missing.len())));
                 } else {
                     footer = footer
                         .child(
@@ -636,7 +793,9 @@ impl Home {
             row = row.child(
                 Button::new(("pack-manual", i), "选择文件")
                     .disabled(busy)
-                    .on_click(cx.listener(move |h, _, _, cx| h.pick_dependency(i, cx))),
+                    .on_click(
+                        cx.listener(move |h, _, _, cx| h.pick_files(FileSelection::One(i), cx)),
+                    ),
             );
         }
         row

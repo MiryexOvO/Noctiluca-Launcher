@@ -1,3 +1,6 @@
+mod supply;
+pub(crate) use supply::is_pack_archive;
+
 use anyhow::{Context, Result, bail, ensure};
 use mc_launcher_core::net::download::{Checksum, DownloadTask};
 use serde::Deserialize;
@@ -454,27 +457,6 @@ impl Preview {
 
     fn cache_path(&self, index: usize) -> PathBuf {
         self.cache.path().join(index.to_string())
-    }
-
-    pub fn supply(&self, index: usize, source: &Path, cancel: &AtomicBool) -> Result<()> {
-        let file = self.files.get(index).context("清单文件不存在")?;
-        let mut input = File::open(source).context("无法读取所选文件")?;
-        let mut copy = tempfile::NamedTempFile::new_in(self.cache.path())?;
-        io::copy(&mut input, &mut copy)?;
-        ensure!(
-            mc_launcher_core::io::hash::sha1_file(copy.path())?
-                .eq_ignore_ascii_case(&file.hashes["sha1"]),
-            "{} 与清单 SHA-1 不符，请选择指定版本",
-            file.path
-        );
-        self.check_sha512(file, copy.path(), cancel)?;
-        ensure!(
-            !cancel.load(std::sync::atomic::Ordering::Relaxed),
-            "已取消校验"
-        );
-        let saved = copy.persist(self.cache_path(index))?;
-        self.cached_sizes.lock().unwrap()[index] = Some(saved.metadata()?.len());
-        Ok(())
     }
 
     fn check_sha512(&self, file: &PackFile, path: &Path, cancel: &AtomicBool) -> Result<()> {

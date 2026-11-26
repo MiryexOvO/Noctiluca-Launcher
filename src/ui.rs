@@ -378,16 +378,7 @@ impl Home {
                             Update::PackPreview(result, dropped) => {
                                 home.preview_ready(result, dropped, cx)
                             }
-                            Update::PackPrefetched(result) => {
-                                home.cancel = None;
-                                match result {
-                                    Ok(()) => {
-                                        home.failed = false;
-                                        home.status = "可自动下载的必需文件已就绪".into();
-                                    }
-                                    Err(e) => home.pack_finished(Err(e), None, cx),
-                                }
-                            }
+                            Update::PackPrefetched(result) => home.finish_prefetch(result, cx),
                             Update::PackFinished(result, launch) => {
                                 home.pack_finished(result, launch, cx)
                             }

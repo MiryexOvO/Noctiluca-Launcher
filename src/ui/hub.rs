@@ -23,6 +23,7 @@ pub(super) struct Hub {
     releases: Vec<Release>,
     project: Option<Hit>,
     target: Option<Instance>,
+    sharing: Vec<String>,
     catalog: Option<Arc<market::status::Catalog>>,
     installed: std::collections::HashMap<String, Option<market::status::Installed>>,
     status_request: u64,
@@ -79,6 +80,7 @@ impl Hub {
             releases: vec![],
             project: None,
             target: None,
+            sharing: Vec::new(),
             catalog: None,
             installed: Default::default(),
             status_request: 0,
@@ -106,6 +108,7 @@ impl Hub {
         self.releases.clear();
         self.page = 0;
         self.target = None;
+        self.sharing.clear();
         self.project = None;
         self.catalog = None;
         self.installed.clear();
@@ -339,24 +342,31 @@ impl Home {
             None if h.is_pack() => (h.loader, h.result_mc.clone()),
             _ => return,
         };
-        h.target = target;
+        let root = self.root.clone();
+        let items = self.instances.clone();
+        h.target = target.clone();
+        h.sharing.clear();
         h.page = 0;
         h.releases.clear();
         h.loading = true;
         h.error = None;
         h.request += 1;
         let (source, kind, project, request) = (h.source, h.kind, hit.id.clone(), h.request);
-        let task = cx
-            .background_executor()
-            .spawn(async move { market::files(source, kind, loader, &mc, &project) });
+        let task = cx.background_executor().spawn(async move {
+            let sharing = target.as_ref().map_or_else(Vec::new, |item| {
+                market::status::sharing_folder(&root, &items, item, kind)
+            });
+            (sharing, market::files(source, kind, loader, &mc, &project))
+        });
         cx.spawn(async move |view, cx| {
-            let r = task.await;
+            let (sharing, r) = task.await;
             let _ = view.update(cx, |home, cx| {
                 let h = &mut home.hub;
                 if h.request != request {
                     return;
                 }
                 h.loading = false;
+                h.sharing = sharing;
                 match r {
                     Ok(v) => h.releases = v,
                     Err(e) => h.error = Some(format!("{e:#}")),
@@ -606,6 +616,24 @@ impl Home {
         }
         if h.kind == Kind::Mod && found.len() > 1 {
             files = files.child(kicker("此实例已有多个同项目模组，请先在实例中整理。"));
+        }
+        if let Some(target) = &h.target
+            && !h.sharing.is_empty()
+        {
+            let names = h
+                .sharing
+                .iter()
+                .map(|name| format!("「{name}」"))
+                .collect::<Vec<_>>()
+                .join("、");
+            files = files.child(div().rounded_md().bg(rgb(SELECTED)).p_3().text_sm().child(
+                format!(
+                    "「{}」与{}共用{}目录。安装或替换会同时更改这些实例使用的文件。",
+                    target.name,
+                    names,
+                    h.kind.label()
+                ),
+            ));
         }
         for (i, file) in h.releases.iter().enumerate().skip(h.page * 10).take(10) {
             let file = file.clone();

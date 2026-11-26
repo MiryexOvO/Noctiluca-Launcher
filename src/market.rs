@@ -58,6 +58,14 @@ impl Kind {
             Self::Shader => "6552",
         }
     }
+    pub fn content_folder(self) -> Option<&'static str> {
+        match self {
+            Self::Mod => Some("mods"),
+            Self::Resource => Some("resourcepacks"),
+            Self::Shader => Some("shaderpacks"),
+            Self::Pack => None,
+        }
+    }
     pub fn uses_loader(self) -> bool {
         matches!(self, Self::Mod | Self::Pack)
     }
@@ -427,6 +435,9 @@ pub fn install_choice(
     );
     let d = Downloads::new(cancel, &report)?;
     d.check()?;
+    let folder = kind
+        .content_folder()
+        .ok_or_else(|| anyhow::anyhow!("请在整合包预览中安装"))?;
     let game = current.game_dir(root)?;
     if let Some(choice) = selection {
         let found = choice.catalog.scan(&game)?;
@@ -439,17 +450,12 @@ pub fn install_choice(
         }
         if kind == Kind::Mod && !found.is_empty() {
             ensure!(found.len() == 1, "存在多个同项目模组，请先在实例中整理");
-            return crate::mods::replace_pinned(&game.join("mods"), &current, &found[0], file, &d);
+            return crate::mods::replace_pinned(&game.join(folder), &current, &found[0], file, &d);
         }
     }
     if kind == Kind::Mod {
-        return crate::mods::install_pinned(&game.join("mods"), &current, file, &d);
+        return crate::mods::install_pinned(&game.join(folder), &current, file, &d);
     }
-    let folder = match kind {
-        Kind::Resource => "resourcepacks",
-        Kind::Shader => "shaderpacks",
-        _ => bail!("请在整合包预览中安装"),
-    };
     let dir = crate::content::resource_dir(root, &current, folder)?;
     let name = crate::packs::relative(&file.filename)?;
     ensure!(
