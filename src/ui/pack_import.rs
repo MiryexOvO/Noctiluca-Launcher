@@ -58,6 +58,16 @@ impl Home {
             self.match_files(paths.to_vec(), true, cx);
             return;
         }
+        if !new_mrpack
+            && matches!(
+                self.page,
+                Page::Detail | Page::Files | Page::Mods | Page::LocalResources
+            )
+            && self.instances.get(self.selected).is_some()
+        {
+            self.inspect_local_drop(paths.to_vec(), cx);
+            return;
+        }
         if new_mrpack || archive.is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
             self.install_pack(hub::Pack::Dropped(paths[0].clone()), cx);
         } else {

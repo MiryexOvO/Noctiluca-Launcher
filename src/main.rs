@@ -12,6 +12,7 @@ mod game;
 mod instance_icon;
 mod java;
 mod library;
+mod local_resources;
 mod logs;
 mod market;
 mod memory;

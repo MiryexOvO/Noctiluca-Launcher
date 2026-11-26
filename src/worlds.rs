@@ -1,3 +1,5 @@
+pub(crate) mod history;
+
 use crate::{
     library::{self, Instance},
     market::icon::read_thumbnail,

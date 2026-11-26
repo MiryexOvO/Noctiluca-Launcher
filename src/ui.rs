@@ -6,6 +6,7 @@ mod hub;
 mod instance_controls;
 mod instance_panel;
 mod local_mods;
+mod local_resources;
 mod manager;
 mod motion;
 mod pack_import;
@@ -45,6 +46,9 @@ use crate::{
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Library,
+    LocalResources,
+    WorldHistory,
+    Memory,
     Hub,
     Settings,
     Console,
@@ -60,7 +64,7 @@ enum Page {
 }
 enum Update {
     Started(String, u32),
-    Exited(String, Result<()>),
+    Exited(String, Result<()>, bool),
     Imported(Box<Instance>),
     Changed(Box<Instance>),
     PackPreview(Result<(PathBuf, Box<crate::packs::Preview>)>, bool),
@@ -97,6 +101,8 @@ pub struct Home {
     hits: Vec<mods::Hit>,
     local_mods: local_mods::LocalMods,
     worlds: worlds::WorldList,
+    history: worlds::History,
+    local_drop: Option<crate::local_resources::Plan>,
     searching: bool,
     copying: bool,
     backups: Vec<backups::Backup>,
@@ -107,6 +113,7 @@ pub struct Home {
     fetching: bool,
     cancel: Option<Arc<AtomicBool>>,
     running: std::collections::HashMap<String, u32>,
+    issues: std::collections::HashMap<String, crate::logs::Issue>,
     outcomes: std::collections::HashMap<String, (bool, String)>,
     status: String,
     failed: bool,
@@ -186,6 +193,8 @@ impl Home {
             hits: Vec::new(),
             local_mods: local_mods::LocalMods::new(window, cx),
             worlds: Default::default(),
+            history: Default::default(),
+            local_drop: None,
             searching: false,
             copying: false,
             backups: Vec::new(),
@@ -196,6 +205,7 @@ impl Home {
             fetching: false,
             cancel: None,
             running: Default::default(),
+            issues: Default::default(),
             outcomes: Default::default(),
             status: "就绪".into(),
             failed: false,
@@ -268,6 +278,9 @@ impl Home {
         };
         let root = self.root.clone();
         let instance = self.instances[self.selected].clone();
+        if !install_only {
+            self.issues.remove(&instance.id);
+        }
         self.outcomes.remove(&instance.id);
         let player = self.accounts.current().cloned();
         let (tx, rx) = async_channel::unbounded();
@@ -292,7 +305,7 @@ impl Home {
             let _ = tx.try_send(if install_only {
                 Update::Finished(result, format!("「{}」安装与校验完成", instance.name))
             } else {
-                Update::Exited(instance.id, result)
+                Update::Exited(instance.id, result, cancel.load(Ordering::Relaxed))
             });
         });
         self.listen(rx, cx);
@@ -312,13 +325,19 @@ impl Home {
                                 home.cancel = None;
                                 home.status = format!("游戏运行中 · PID {pid}");
                             }
-                            Update::Exited(id, result) => {
+                            Update::Exited(id, result, cancelled) => {
                                 if home.running.remove(&id).is_none() {
                                     home.cancel = None;
                                 }
                                 let (failed, msg) = match result {
                                     Ok(()) => (false, "游戏已正常退出".to_string()),
-                                    Err(e) => (true, format!("{e:#}")),
+                                    Err(_) if cancelled => (false, "已取消启动".into()),
+                                    Err(e) => {
+                                        let issue = crate::logs::Issue::from_error(&e);
+                                        let summary = issue.summary.clone();
+                                        home.issues.insert(id.clone(), issue);
+                                        (true, summary)
+                                    }
                                 };
                                 if home
                                     .instances
@@ -514,6 +533,18 @@ impl Home {
             list = list.child(
                 div()
                     .id(("instance", idx))
+                    .when(!busy && self.page != Page::Import, |row| {
+                        row.drag_over::<ExternalPaths>(|style, _, _, cx| {
+                            style.bg(cx.theme().colors.active)
+                        })
+                        .on_drop(cx.listener(
+                            move |h, paths: &ExternalPaths, _, cx| {
+                                cx.stop_propagation();
+                                h.show_instance(idx, cx);
+                                h.drop_pack(paths.paths(), cx);
+                            },
+                        ))
+                    })
                     .h(px(motion::ROW))
                     .flex_none()
                     .rounded_md()
@@ -746,8 +777,60 @@ impl Home {
                 ),
             )
             .child(frame.section(actions, 1))
+            .when_some(self.issues.get(&item.id), |el, issue| {
+                el.child(self.issue_panel(issue, busy, cx))
+            })
             .child(frame.section(self.memory_panel(busy, cx), 2))
             .child(frame.section(self.instance_panel(wide, busy, cx), 3))
+    }
+
+    fn issue_panel(&self, issue: &crate::logs::Issue, busy: bool, cx: &Context<Self>) -> Div {
+        use crate::logs::Action;
+        let log = issue.log;
+        let mut actions = div().flex().flex_wrap().gap_2();
+        if let Some(action) = issue.action.clone() {
+            let title = match action {
+                Action::Find(_) => "查找兼容版本",
+                Action::Java => "检查 Java 设置",
+                Action::Memory => "调整游戏内存",
+                Action::Repair => "安装 / 修复",
+                Action::Mods => "查看已安装模组",
+            };
+            actions = actions.child(
+                Button::new("issue-action", title)
+                    .disabled(busy || self.searching)
+                    .on_click(cx.listener(move |h, _, _, cx| match &action {
+                        Action::Find(id) => h.find_dependency(id, cx),
+                        Action::Java => h.open_settings(cx),
+                        Action::Memory => {
+                            h.page = Page::Memory;
+                            cx.notify();
+                        }
+                        Action::Repair => h.play(true, cx),
+                        Action::Mods => h.open_mods(cx),
+                    })),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_md()
+            .p_3()
+            .bg(cx.theme().colors.surface)
+            .child(heading("上次启动失败"))
+            .child(issue.summary.clone())
+            .child(
+                actions
+                    .child(
+                        Button::new("issue-log", "查看日志")
+                            .on_click(cx.listener(move |h, _, _, cx| h.start_console(log, cx))),
+                    )
+                    .child(
+                        Button::new("issue-export", "导出诊断包")
+                            .on_click(cx.listener(|h, _, _, cx| h.export_report(cx))),
+                    ),
+            )
     }
 
     fn start_console(&mut self, log: &'static str, cx: &mut Context<Self>) {
@@ -1279,6 +1362,24 @@ impl Render for Home {
         let page = match self.page {
             Page::Preferences => self.preferences_page(cx).into_any_element(),
             Page::Content => self.content_page(cx).into_any_element(),
+            Page::WorldHistory => self.history_page(cx).into_any_element(),
+            Page::LocalResources => self.local_drop_page(cx).into_any_element(),
+            Page::Memory => div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(Button::new("memory-back", "返回实例").on_click(cx.listener(
+                    |h, _, _, cx| {
+                        h.page = Page::Detail;
+                        cx.notify();
+                    },
+                )))
+                .child(self.memory_panel(
+                    self.cancel.is_some()
+                        || self.running.contains_key(&self.instances[self.selected].id),
+                    cx,
+                ))
+                .into_any_element(),
             Page::Files => self.files_page(cx).into_any_element(),
             Page::Library => self.manager_page(cx).into_any_element(),
             Page::Hub => self.hub_page(cx).into_any_element(),

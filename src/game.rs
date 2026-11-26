@@ -429,7 +429,7 @@ fn prepare_and_play(
     writeln!(journal, "{exit}")?;
     if !exit.success() {
         let reason = crate::logs::launch_failure(root, instance, launched_at);
-        anyhow::bail!("游戏异常退出（{exit}）。{reason}");
+        return Err(anyhow::Error::new(reason).context(format!("游戏异常退出（{exit}）")));
     }
     Ok(())
 }

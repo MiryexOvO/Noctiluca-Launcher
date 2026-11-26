@@ -1,4 +1,6 @@
+mod issue;
 use anyhow::{Context, Result};
+pub(crate) use issue::{Action, Issue};
 use regex::Regex;
 use std::{
     fs::{self, File},
@@ -31,51 +33,66 @@ pub fn tail(path: &Path) -> Result<String> {
 }
 
 pub fn diagnosis(text: &str) -> Option<&'static str> {
-    let text = text.to_ascii_lowercase();
-    for (needle, hint) in [
+    known_failure(text).map(|(hint, _)| hint)
+}
+
+fn known_failure(text: &str) -> Option<(&'static str, Option<Action>)> {
+    let lower = text.to_ascii_lowercase();
+    [
         (
             "can't be written",
             "游戏进程无法写入实例目录中的 JAR。请检查目录写入权限和 Windows 对该进程的限制。",
+            None,
         ),
         (
             "readonlyfilesystemexception",
             "Java 将实例目录中的文件判定为只读，请检查实例目录和进程权限。",
+            None,
         ),
         (
             "outofmemoryerror",
             "Java 堆内存不足，可尝试提高此实例的最大内存。",
+            Some(Action::Memory),
         ),
         (
             "could not reserve enough space",
             "Java 无法分配所选内存，可降低内存或检查 Java 架构。",
+            Some(Action::Memory),
         ),
         (
             "unsupportedclassversionerror",
             "当前 Java 版本过低，请检查自定义 Java 设置。",
+            Some(Action::Java),
         ),
         (
             "incompatible mod set",
             "模组依赖不兼容，加载器在游戏日志中列出了冲突项。",
+            Some(Action::Mods),
         ),
         (
             "incompatible mods found",
             "加载器发现不兼容的模组，请核对模组版本及其依赖。",
+            Some(Action::Mods),
         ),
         (
             "nosuchmethoderror",
             "库或模组之间的方法版本不匹配，请核对最近更换的模组。",
+            Some(Action::Mods),
         ),
         (
             "could not find or load main class",
             "缺少游戏入口类，请运行安装 / 修复。",
+            Some(Action::Repair),
         ),
-        ("glfw error 65542", "OpenGL 初始化失败，请检查显卡驱动。"),
-    ] {
-        if text.contains(needle) {
-            return Some(hint);
-        }
-    }
-    None
+        (
+            "glfw error 65542",
+            "OpenGL 初始化失败，请检查显卡驱动。",
+            None,
+        ),
+    ]
+    .into_iter()
+    .find(|(needle, _, _)| lower.contains(needle))
+    .map(|(_, hint, action)| (hint, action))
 }
 
 pub fn redact(text: &str) -> String {
@@ -205,7 +222,7 @@ pub fn launch_failure(
     root: &Path,
     item: &crate::library::Instance,
     started: std::time::SystemTime,
-) -> String {
+) -> Issue {
     let mut text = String::new();
     for (label, p) in sources(root, item).unwrap_or_default().into_iter().rev() {
         if !matches!(label, "latest.log" | "crash-report.txt" | "game-output.log") {
@@ -223,5 +240,5 @@ pub fn launch_failure(
             text.push('\n');
         }
     }
-    cause(&text)
+    Issue::from_log(&text)
 }

@@ -206,6 +206,20 @@ impl Home {
         self.listen(rx, cx);
     }
 
+    pub(super) fn find_dependency(&mut self, id: &str, cx: &mut Context<Self>) {
+        let item = &self.instances[self.selected];
+        self.hub.kind = Kind::Mod;
+        self.hub.loader = Some(item.loader);
+        self.hub
+            .mc
+            .update(cx, |input, cx| input.set_text(item.version.clone(), cx));
+        self.hub
+            .query
+            .update(cx, |input, cx| input.set_text(id.to_owned(), cx));
+        self.page = Page::Hub;
+        self.discover(0, false, cx);
+    }
+
     pub(super) fn discover(&mut self, offset: usize, paging: bool, cx: &mut Context<Self>) {
         let h = &mut self.hub;
         if !paging {

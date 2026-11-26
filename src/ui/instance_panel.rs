@@ -127,7 +127,8 @@ impl Home {
                 panel(cx, "实例资源")
                     .min_w_0()
                     .when(wide, |el| el.flex_1())
-                    .child(tiles),
+                    .child(tiles)
+                    .child(kicker(cx, "拖入模组、资源包或光影，即可装到这个实例。")),
             )
             .child(
                 panel(cx, "实例工具")
