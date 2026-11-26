@@ -20,6 +20,7 @@ mod packs;
 mod preferences;
 mod third_party;
 mod ui;
+mod worlds;
 
 use ely_gpui_component::{Assets, theme::ActiveTheme};
 use gpui::{prelude::*, *};

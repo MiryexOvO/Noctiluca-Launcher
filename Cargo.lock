@@ -1785,6 +1785,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastnbt"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9dcc36fee27b17c9c183294d6e739cf218b01ce0fc545c31d8be3913d961731"
+dependencies = [
+ "byteorder",
+ "cesu8",
+ "serde",
+ "serde_bytes",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4007,6 +4019,8 @@ dependencies = [
  "dunce",
  "ely-gpui-component",
  "embed-resource",
+ "fastnbt",
+ "flate2",
  "gpui-pre",
  "gpui-pre-platform",
  "hex",
@@ -4025,6 +4039,7 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.11.1",
  "tempfile",
+ "toml 1.2.3+spec-1.1.0",
  "url",
  "uuid",
  "walkdir",

@@ -80,6 +80,10 @@ impl Home {
         self.content.resource_hits.clear();
         self.page = Page::Files;
         self.content.names.clear();
+        if kind == "saves" {
+            self.read_worlds(cx);
+            return;
+        }
         let result = (|| -> Result<_> {
             let dir = model::resource_dir(&self.root, &self.instances[self.selected], kind)?;
             let mut names = fs::read_dir(dir)?
@@ -141,13 +145,13 @@ impl Home {
             );
         }
         if t.kind == "mods" {
-            actions = actions.child(Button::new("files-mods", "管理模组").on_click(cx.listener(
-                |h, _, _, cx| {
-                    h.page = Page::Mods;
-                    h.hits.clear();
-                    h.refresh_mods(cx);
-                },
-            )));
+            actions = actions.child(
+                Button::new("files-mods", "管理模组")
+                    .on_click(cx.listener(|h, _, _, cx| h.open_mods(cx))),
+            );
+        }
+        if t.kind == "saves" {
+            return self.world_rows(page, actions, cx);
         }
         page = page.child(actions);
         if matches!(t.kind, "resourcepacks" | "shaderpacks") {

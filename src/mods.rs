@@ -1,3 +1,4 @@
+pub(crate) mod local;
 use anyhow::{Context, Result, bail, ensure};
 use mc_launcher_core::{
     io::hash::sha1_file,
@@ -376,7 +377,7 @@ pub fn upgrades(root: &Path, item: &Instance, curse: bool) -> Result<Vec<Upgrade
         if curse {
             prints.push(crate::curse::fingerprint(&fs::read(path)?));
         }
-        local.insert(hash, name);
+        local.entry(hash).or_insert_with(Vec::new).push(name);
     }
     if local.is_empty() {
         return Ok(vec![]);
@@ -384,18 +385,20 @@ pub fn upgrades(root: &Path, item: &Instance, curse: bool) -> Result<Vec<Upgrade
     let mut result = vec![];
     if curse {
         for (hash, (project, version)) in crate::curse::match_jars(&prints)? {
-            if let Some(old) = local.get(&hash) {
+            if let Some(names) = local.get(&hash) {
                 let f = crate::curse::latest_jar(project, item.loader, &item.version)?;
                 if f.id > version && f.hash != hash {
-                    result.push(Upgrade {
-                        old: old.clone(),
-                        hash,
-                        new: download_name(&project.to_string(), &f.name)?,
-                        hit: Hit {
-                            project_id: format!("cf:{}", f.project),
-                            title: f.name,
-                        },
-                    });
+                    for old in names {
+                        result.push(Upgrade {
+                            old: old.clone(),
+                            hash: hash.clone(),
+                            new: download_name(&project.to_string(), &f.name)?,
+                            hit: Hit {
+                                project_id: format!("cf:{}", f.project),
+                                title: f.name.clone(),
+                            },
+                        });
+                    }
                 }
             }
         }
@@ -405,20 +408,22 @@ pub fn upgrades(root: &Path, item: &Instance, curse: bool) -> Result<Vec<Upgrade
         for batch in keys.chunks(100) {
             let found:HashMap<String,Version>=http.post(format!("{API}/version_files/update")).json(&serde_json::json!({"hashes":batch,"algorithm":"sha1","loaders":[loader(item)?],"game_versions":[item.version]})).send()?.error_for_status()?.json()?;
             for (hash, v) in found {
-                if let (Some(old), Some(f)) = (
+                if let (Some(names), Some(f)) = (
                     local.get(&hash),
                     v.files.iter().find(|f| f.primary).or(v.files.first()),
                 ) && v.files.iter().all(|f| f.hashes.get("sha1") != Some(&hash))
                 {
-                    result.push(Upgrade {
-                        old: old.clone(),
-                        hash,
-                        new: download_name(&v.project_id, &f.filename)?,
-                        hit: Hit {
-                            project_id: v.project_id,
-                            title: f.filename.clone(),
-                        },
-                    });
+                    for old in names {
+                        result.push(Upgrade {
+                            old: old.clone(),
+                            hash: hash.clone(),
+                            new: download_name(&v.project_id, &f.filename)?,
+                            hit: Hit {
+                                project_id: v.project_id.clone(),
+                                title: f.filename.clone(),
+                            },
+                        });
+                    }
                 }
             }
         }
@@ -507,50 +512,6 @@ fn download_name(project: &str, raw: &str) -> Result<String> {
     } else {
         raw.into()
     })
-}
-
-pub fn describe(path: &Path) -> Option<String> {
-    use std::io::Read;
-    let mut zip = zip::ZipArchive::new(fs::File::open(path).ok()?).ok()?;
-    for kind in ["fabric.mod.json", "quilt.mod.json"] {
-        if let Ok(entry) = zip.by_name(kind)
-            && entry.size() < 1024 * 1024
-        {
-            let doc: serde_json::Value = serde_json::from_reader(entry).ok()?;
-            let data = doc.get("quilt_loader").unwrap_or(&doc);
-            let name = data
-                .pointer("/metadata/name")
-                .or_else(|| data.get("name"))
-                .or_else(|| data.get("id"))?
-                .as_str()?;
-            return Some(format!(
-                "{name} · {}",
-                data["version"].as_str().unwrap_or("?")
-            ));
-        }
-    }
-    for kind in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
-        if let Ok(entry) = zip.by_name(kind) {
-            let mut meta = String::new();
-            entry.take(512 * 1024).read_to_string(&mut meta).ok()?;
-            let fields = meta.split("[[mods]]").nth(1)?.split("[[").next()?;
-            let field = |key: &str| {
-                fields
-                    .lines()
-                    .filter_map(|s| s.split_once('='))
-                    .find(|(k, _)| k.trim() == key)
-                    .map(|(_, v)| v.trim().trim_matches('"'))
-            };
-            let name = field("displayName").or_else(|| field("modId"))?;
-            let v = field("version").unwrap_or("");
-            return Some(if v.starts_with('$') || v.is_empty() {
-                name.into()
-            } else {
-                format!("{name} · {v}")
-            });
-        }
-    }
-    None
 }
 
 pub fn recover(game: &Path) -> Result<()> {

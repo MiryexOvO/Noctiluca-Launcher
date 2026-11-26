@@ -5,6 +5,7 @@ mod create;
 mod hub;
 mod instance_controls;
 mod instance_panel;
+mod local_mods;
 mod manager;
 mod motion;
 mod pack_import;
@@ -13,6 +14,7 @@ mod preferences;
 mod project_icon;
 mod settings;
 mod titlebar;
+mod worlds;
 use std::{
     fs,
     path::PathBuf,
@@ -93,8 +95,8 @@ pub struct Home {
     wizard: create::Wizard,
     mod_query: Entity<TextInput>,
     hits: Vec<mods::Hit>,
-    jars: Vec<String>,
-    mod_labels: std::collections::HashMap<String, String>,
+    local_mods: local_mods::LocalMods,
+    worlds: worlds::WorldList,
     searching: bool,
     copying: bool,
     backups: Vec<backups::Backup>,
@@ -182,8 +184,8 @@ impl Home {
             wizard: Default::default(),
             mod_query,
             hits: Vec::new(),
-            jars: Vec::new(),
-            mod_labels: Default::default(),
+            local_mods: local_mods::LocalMods::new(window, cx),
+            worlds: Default::default(),
             searching: false,
             copying: false,
             backups: Vec::new(),
@@ -221,7 +223,7 @@ impl Home {
 
     fn can_close(&mut self, cx: &mut Context<Self>) -> bool {
         let reason = if self.copying {
-            "正在复制实例，请等待文件写入完成"
+            "正在写入文件，请稍候"
         } else if !self.running.is_empty() {
             "请先退出游戏，或将启动器最小化"
         } else if self.cancel.is_some() {
@@ -949,47 +951,6 @@ impl Home {
         page
     }
 
-    fn refresh_mods(&mut self, cx: &mut Context<Self>) {
-        let result = self.instances[self.selected]
-            .game_dir(&self.root)
-            .and_then(|dir| mods::installed(&dir.join("mods")));
-        match result {
-            Ok(jars) => {
-                self.jars = jars;
-                self.mod_labels.clear();
-                let item = self.instances[self.selected].clone();
-                let root = self.root.clone();
-                let jars = self.jars.clone();
-                if crate::preferences::current().name_style == 0 {
-                    let id = item.id.clone();
-                    let task = cx.background_executor().spawn(async move {
-                        let dir = item.game_dir(&root).ok()?.join("mods");
-                        Some(
-                            jars.into_iter()
-                                .filter_map(|name| {
-                                    Some((name.clone(), mods::describe(&dir.join(name))?))
-                                })
-                                .collect(),
-                        )
-                    });
-                    cx.spawn(async move |view, cx| {
-                        if let Some(map) = task.await {
-                            let _ = view.update(cx, |h, cx| {
-                                if h.page == Page::Mods && h.instances[h.selected].id == id {
-                                    h.mod_labels = map;
-                                    cx.notify();
-                                }
-                            });
-                        }
-                    })
-                    .detach();
-                }
-            }
-            Err(e) => self.message(Err(e), cx),
-        }
-        cx.notify();
-    }
-
     fn search_mods(&mut self, cx: &mut Context<Self>) {
         self.searching = true;
         self.hits.clear();
@@ -1060,6 +1021,8 @@ impl Home {
         let id = item.id.clone();
         let root = self.root.clone();
         let curse = self.content.curse;
+        let revision = self.local_mods.revision;
+        self.local_mods.checked = false;
         self.searching = true;
         self.content.upgrades.clear();
         self.status = "校验本地模组并查询兼容版本".into();
@@ -1070,11 +1033,16 @@ impl Home {
             let r = task.await;
             let _ = view.update(cx, |h, cx| {
                 h.searching = false;
-                if h.page == Page::Mods && h.instances[h.selected].id == id {
+                if h.page == Page::Mods
+                    && h.instances.get(h.selected).is_some_and(|i| i.id == id)
+                    && h.local_mods.revision == revision
+                    && h.content.curse == curse
+                {
                     match r {
                         Ok(v) => {
                             h.status = format!("{} 个模组有可用更新", v.len());
                             h.content.upgrades = v;
+                            h.local_mods.checked = true;
                             h.failed = false;
                         }
                         Err(e) => h.message(Err(e), cx),
@@ -1091,6 +1059,7 @@ impl Home {
         let root = self.root.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
+        self.local_mods.checked = false;
         self.content.upgrades.clear();
         let (tx, rx) = async_channel::unbounded();
         std::thread::spawn(move || {
@@ -1111,6 +1080,22 @@ impl Home {
             .child(kicker(cx, &item.name))
             .child(heading("模组管理"))
             .child(
+                div().flex().gap_2().children(
+                    ["已安装模组", "查找新模组"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, label)| {
+                            Button::new(("mod-tab", i), label)
+                                .when(self.local_mods.online == (i == 1), |b| b.primary())
+                                .disabled(busy)
+                                .on_click(cx.listener(move |h, _, _, cx| {
+                                    h.local_mods.online = i == 1;
+                                    cx.notify();
+                                }))
+                        }),
+                ),
+            )
+            .child(
                 div()
                     .flex()
                     .flex_wrap()
@@ -1124,28 +1109,18 @@ impl Home {
                                     h.content.curse = i == 1;
                                     h.hits.clear();
                                     h.content.upgrades.clear();
+                                    h.local_mods.checked = false;
                                     cx.notify();
                                 }))
                         },
                     ))
-                    .child(
-                        Button::new("mod-updates", "检查已装模组更新")
-                            .disabled(busy)
-                            .on_click(cx.listener(|h, _, _, cx| h.check_mod_updates(cx))),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .items_center()
-                    .child(div().flex_1().child(Input::new(&self.mod_query)))
-                    .child(
-                        Button::new("mod-search", "搜索")
-                            .primary()
-                            .disabled(busy)
-                            .on_click(cx.listener(|home, _, _, cx| home.search_mods(cx))),
-                    ),
+                    .when(!self.local_mods.online, |row| {
+                        row.child(
+                            Button::new("mod-updates", "检查已装模组更新")
+                                .disabled(busy)
+                                .on_click(cx.listener(|h, _, _, cx| h.check_mod_updates(cx))),
+                        )
+                    }),
             );
         if self.cancel.is_some() {
             page = page.child(Button::new("cancel-mod", "取消安装").on_click(cx.listener(
@@ -1157,6 +1132,22 @@ impl Home {
                 },
             )));
         }
+        if !self.local_mods.online {
+            return page.child(self.installed_mods(cx));
+        }
+        page = page.child(
+            div()
+                .flex()
+                .gap_2()
+                .items_center()
+                .child(div().flex_1().child(Input::new(&self.mod_query)))
+                .child(
+                    Button::new("mod-search", "搜索")
+                        .primary()
+                        .disabled(busy)
+                        .on_click(cx.listener(|home, _, _, cx| home.search_mods(cx))),
+                ),
+        );
         for (idx, hit) in self.hits.iter().enumerate() {
             let hit = hit.clone();
             page =
@@ -1174,43 +1165,6 @@ impl Home {
                                 })),
                         ),
                 );
-        }
-        for (i, u) in self.content.upgrades.iter().enumerate() {
-            let u = u.clone();
-            page = page.child(
-                Button::new(("upgrade", i), format!("更新 {} → {}", u.old, u.new))
-                    .disabled(busy)
-                    .on_click(cx.listener(move |h, _, _, cx| h.apply_mod_update(u.clone(), cx))),
-            );
-        }
-        page = page.child(kicker(cx, &format!("已安装  /  {}", self.jars.len())));
-        for (idx, name) in self.jars.iter().enumerate() {
-            let name = name.clone();
-            let disabled = name.ends_with(".disabled");
-            page = page.child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .items_center()
-                    .child(
-                        div().flex_1().min_w_0().truncate().child(
-                            self.mod_labels
-                                .get(&name)
-                                .map(|s| format!("{s}  ·  {name}"))
-                                .unwrap_or_else(|| name.clone()),
-                        ),
-                    )
-                    .child(
-                        Button::new(("toggle-mod", idx), if disabled { "启用" } else { "停用" })
-                            .disabled(busy)
-                            .on_click(cx.listener(move |home, _, _, cx| {
-                                let result =
-                                    mods::toggle(&home.root, &home.instances[home.selected], &name);
-                                home.message(result, cx);
-                                home.refresh_mods(cx);
-                            })),
-                    ),
-            );
         }
         page
     }

@@ -58,12 +58,7 @@ impl Home {
                 "管理模组",
                 IconName::Puzzle,
                 !busy,
-                |h, cx| {
-                    h.page = Page::Mods;
-                    h.hits.clear();
-                    h.content.curse = crate::preferences::current().community == 1;
-                    h.refresh_mods(cx);
-                },
+                Home::open_mods,
             ),
             (
                 "settings",

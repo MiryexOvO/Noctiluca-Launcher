@@ -7,6 +7,9 @@ rust-version = "1.95"
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 hex = "0.4"
+fastnbt = "2.6"
+flate2 = "1"
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 dunce = "1"
 md-5 = "0.10"
 base64 = "0.22"
