@@ -8,6 +8,7 @@ mod instance_panel;
 mod local_mods;
 mod local_resources;
 mod manager;
+mod mod_history;
 mod motion;
 mod organize;
 mod pack_import;
@@ -51,6 +52,7 @@ enum Page {
     Organize,
     LocalResources,
     WorldHistory,
+    ModHistory,
     Memory,
     Hub,
     Settings,
@@ -105,6 +107,7 @@ pub struct Home {
     mod_query: Entity<TextInput>,
     hits: Vec<mods::Hit>,
     local_mods: local_mods::LocalMods,
+    changes: mod_history::View,
     worlds: worlds::WorldList,
     history: worlds::History,
     local_drop: Option<crate::local_resources::Plan>,
@@ -203,6 +206,7 @@ impl Home {
             mod_query,
             hits: Vec::new(),
             local_mods: local_mods::LocalMods::new(window, cx),
+            changes: Default::default(),
             worlds: Default::default(),
             history: Default::default(),
             local_drop: None,
@@ -1169,7 +1173,7 @@ impl Home {
         .detach();
         cx.notify();
     }
-    fn apply_mod_update(&mut self, u: mods::Upgrade, cx: &mut Context<Self>) {
+    fn apply_mod_update(&mut self, updates: Vec<mods::Upgrade>, cx: &mut Context<Self>) {
         let item = self.instances[self.selected].clone();
         let root = self.root.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1178,7 +1182,7 @@ impl Home {
         self.content.upgrades.clear();
         let (tx, rx) = async_channel::unbounded();
         std::thread::spawn(move || {
-            let result = mods::upgrade(&root, &item, &u, &cancel, |s| {
+            let result = mods::upgrade(&root, &item, &updates, &cancel, |s| {
                 let _ = tx.try_send(Update::Status(s));
             });
             let _ = tx.try_send(Update::Finished(result, "模组更新完成".into()));
@@ -1414,6 +1418,7 @@ impl Render for Home {
                 ))
                 .into_any_element(),
             Page::Files => self.files_page(cx).into_any_element(),
+            Page::ModHistory => self.mod_history_page(cx).into_any_element(),
             Page::Organize => self.organize_page(cx).into_any_element(),
             Page::Library => self.manager_page(cx).into_any_element(),
             Page::Hub => self.hub_page(cx).into_any_element(),

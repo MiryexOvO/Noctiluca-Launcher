@@ -441,6 +441,12 @@ pub fn install_choice(
         .content_folder()
         .ok_or_else(|| anyhow::anyhow!("请在整合包预览中安装"))?;
     let game = current.game_dir(root)?;
+    let editor = if kind == Kind::Mod {
+        Some(crate::mods::history::Editor::open(root, &current)?)
+    } else {
+        None
+    };
+    let mut previous = None;
     if let Some(choice) = selection {
         let found = choice.catalog.scan(&game)?;
         ensure!(found == choice.seen, "目标实例的文件已变更，请重新选择版本");
@@ -450,13 +456,13 @@ pub fn install_choice(
         {
             return Ok(());
         }
-        if kind == Kind::Mod && !found.is_empty() {
-            ensure!(found.len() == 1, "存在多个同项目模组，请先在实例中整理");
-            return crate::mods::replace_pinned(&game.join(folder), &current, &found[0], file, &d);
+        if editor.is_some() {
+            ensure!(found.len() <= 1, "存在多个同项目模组，请先在实例中整理");
+            previous = found.into_iter().next();
         }
     }
-    if kind == Kind::Mod {
-        return crate::mods::install_pinned(&game.join(folder), &current, file, &d);
+    if let Some(editor) = editor {
+        return crate::mods::change_pinned(&editor, &current, previous.as_ref(), file, &d);
     }
     let dir = crate::content::resource_dir(root, &current, folder)?;
     let name = crate::packs::relative(&file.filename)?;

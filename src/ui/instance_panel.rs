@@ -54,6 +54,13 @@ impl Home {
                 Home::open_content as fn(&mut Home, &mut Context<Home>),
             ),
             (
+                "mod-history",
+                "最近改动",
+                IconName::History,
+                !busy,
+                Home::open_mod_history,
+            ),
+            (
                 "manage-mods",
                 "管理模组",
                 IconName::Puzzle,

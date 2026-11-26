@@ -226,7 +226,9 @@ pub fn lock_instance(
     } else {
         None
     };
-    crate::mods::recover(&item.game_dir(root)?)?;
+    let directory = item.game_dir(root)?;
+    crate::mods::recover(&directory)?;
+    crate::mods::history::recover(root, &directory.join("mods"))?;
     Ok((local, game))
 }
 

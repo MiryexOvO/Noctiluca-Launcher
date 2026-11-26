@@ -151,26 +151,3 @@ impl Check {
         Ok(())
     }
 }
-pub(super) fn move_new(from: &Path, to: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    let wide = |p: &Path| {
-        p.as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<u16>>()
-    };
-    let a = wide(from);
-    let b = wide(to);
-    if unsafe {
-        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
-            a.as_ptr(),
-            b.as_ptr(),
-            windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}

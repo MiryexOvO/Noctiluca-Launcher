@@ -54,6 +54,56 @@ fn version_of(java: &Path) -> Option<u32> {
     })
 }
 
+// Only cache real runtimes. PATH shims may change their target without changing the shim.
+type FileStamp = (u64, u64, u64);
+type RuntimeStamp = (FileStamp, FileStamp, Option<FileStamp>, Option<FileStamp>);
+fn probe_major(shared: &Path, java: &Path, quick: bool) -> Option<u32> {
+    use sha2::{Digest, Sha256};
+    use std::os::windows::fs::MetadataExt;
+    let identify = || {
+        let bin = dunce::canonicalize(java).ok()?;
+        let home = bin.parent()?.parent()?;
+        let vm = [
+            "bin/server/jvm.dll",
+            "jre/bin/server/jvm.dll",
+            "bin/client/jvm.dll",
+        ]
+        .into_iter()
+        .map(|n| home.join(n))
+        .find(|p| p.is_file())?;
+        let stamp = |path: &Path| {
+            let m = fs::metadata(path).ok()?;
+            Some((m.len(), m.last_write_time(), m.creation_time()))
+        };
+        let identity = (
+            stamp(&bin)?,
+            stamp(&vm)?,
+            stamp(&home.join("release")),
+            stamp(&bin.with_file_name("java.exe")),
+        );
+        let key = hex::encode(Sha256::digest(bin.to_str()?.as_bytes()));
+        Some((
+            shared.join("java-probes").join(format!("{key}.json")),
+            identity,
+        ))
+    };
+    let Some((record, identity)) = identify() else {
+        return version_of(java);
+    };
+    if quick
+        && let Ok(bytes) = fs::read(&record)
+        && let Ok((stored, major)) = serde_json::from_slice::<(RuntimeStamp, u32)>(&bytes)
+        && stored == identity
+    {
+        return Some(major);
+    }
+    let major = version_of(java)?;
+    if let Ok(bytes) = serde_json::to_vec(&(identity, major)) {
+        let _ = crate::library::atomic_write(&record, &bytes);
+    }
+    Some(major)
+}
+
 fn child_directories(path: &Path) -> impl Iterator<Item = PathBuf> {
     fs::read_dir(path)
         .into_iter()
@@ -152,6 +202,17 @@ pub fn select(
     downloads: &Downloads,
     override_path: Option<&Path>,
 ) -> Result<PathBuf> {
+    select_mode(shared, version, downloads, override_path, false)
+}
+
+pub fn select_mode(
+    shared: &Path,
+    version: &VersionJson,
+    downloads: &Downloads,
+    override_path: Option<&Path>,
+    quick: bool,
+) -> Result<PathBuf> {
+    let probe = |p: &Path| probe_major(shared, p, quick);
     let spec = version
         .java_version
         .as_ref()
@@ -163,7 +224,7 @@ pub fn select(
         .or_else(|| crate::setting("JAVA").map(PathBuf::from))
     {
         let detected =
-            version_of(&java).with_context(|| format!("无法执行所选 Java：{}", java.display()))?;
+            probe(&java).with_context(|| format!("无法执行所选 Java：{}", java.display()))?;
         ensure!(
             major != 8 || detected == 8,
             "此旧版游戏需要 Java 8，所选版本为 {detected}"
@@ -184,12 +245,12 @@ pub fn select(
     let dir = shared.join("runtime").join(platform).join(component);
     let managed = dir.join("bin/java.exe");
     let ready = dir.join("installed");
-    if ready.is_file() && version_of(&managed) == Some(major) {
+    if ready.is_file() && probe(&managed) == Some(major) {
         (downloads.report)(format!("使用已有 Java {major}"));
         return Ok(managed);
     }
     if let Some((found, path)) =
-        choose_installed(installed_candidates(shared, platform), major, version_of)
+        choose_installed(installed_candidates(shared, platform), major, probe)
     {
         (downloads.report)(format!("使用本机 Java {found} · {}", path.display()));
         return Ok(path);

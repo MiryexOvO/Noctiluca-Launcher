@@ -12,6 +12,7 @@ pub(super) struct LocalMods {
     loading: bool,
     pub checked: bool,
     pub online: bool,
+    pending: Option<crate::mods::dependents::Toggle>,
 }
 
 impl LocalMods {
@@ -38,6 +39,7 @@ impl LocalMods {
             loading: false,
             checked: false,
             online: false,
+            pending: None,
         }
     }
 }
@@ -62,6 +64,7 @@ impl Home {
         self.local_mods.loading = true;
         self.local_mods.checked = false;
         self.local_mods.rows.clear();
+        self.local_mods.pending = None;
         self.content.upgrades.clear();
         let item = self.instances[self.selected].clone();
         let id = item.id.clone();
@@ -90,9 +93,58 @@ impl Home {
         cx.notify();
     }
 
+    fn toggle_mod(
+        &mut self,
+        name: String,
+        confirmed: Option<mods::dependents::Toggle>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.copying {
+            return;
+        }
+        self.copying = true;
+        self.local_mods.pending = None;
+        let root = self.root.clone();
+        let item = self.instances[self.selected].clone();
+        let id = item.id.clone();
+        let task = cx.background_executor().spawn(async move {
+            let plan = match confirmed {
+                Some(p) => p,
+                None => {
+                    let p = mods::dependents::inspect(
+                        &item.game_dir(&root)?.join("mods"),
+                        item.loader,
+                        &name,
+                    )?;
+                    if !p.affected.is_empty() {
+                        return anyhow::Ok(Some(p));
+                    }
+                    p
+                }
+            };
+            mods::dependents::apply(&root, &item, &plan)?;
+            Ok(None)
+        });
+        cx.spawn(async move |view, cx| {
+            let r = task.await;
+            let _ = view.update(cx, |h, cx| {
+                h.copying = false;
+                if h.page == Page::Mods && h.instances.get(h.selected).is_some_and(|i| i.id == id) {
+                    match r {
+                        Ok(Some(p)) => h.local_mods.pending = Some(p),
+                        Ok(None) => h.refresh_mods(cx),
+                        Err(e) => h.message(Err(e), cx),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
     pub(super) fn installed_mods(&self, cx: &Context<Self>) -> Div {
         let local = &self.local_mods;
-        let busy = self.searching || self.cancel.is_some();
+        let busy = self.searching || self.copying || self.cancel.is_some();
         let mut filters = div().flex().flex_wrap().gap_1();
         for (i, (label, filter)) in [
             ("全部", Filter::All),
@@ -138,6 +190,60 @@ impl Home {
         )
         .child(Input::new(&local.query))
         .child(filters);
+        if let Some(plan) = &local.pending {
+            let names = plan
+                .affected
+                .iter()
+                .map(|(f, n)| {
+                    if n.is_empty() {
+                        f.clone()
+                    } else {
+                        format!("{n}（{f}）")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("、");
+            list = list
+                .child(kicker(
+                    cx,
+                    &format!("停用 {} 也会影响以下已启用的模组：{}", plan.name, names),
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(Button::new("cancel-toggle", "取消").on_click(cx.listener(
+                            |h, _, _, cx| {
+                                h.local_mods.pending = None;
+                                cx.notify();
+                            },
+                        )))
+                        .child(
+                            Button::new(
+                                "cascade-toggle",
+                                format!("一起停用 {} 个模组", 1 + plan.affected.len()),
+                            )
+                            .disabled(busy)
+                            .on_click(cx.listener(|h, _, _, cx| {
+                                if let Some(plan) = h.local_mods.pending.take() {
+                                    h.toggle_mod(plan.name.clone(), Some(plan), cx);
+                                }
+                            })),
+                        ),
+                );
+        }
+        if local.filter == Filter::Updates && self.content.upgrades.len() > 1 {
+            list = list.child(
+                Button::new(
+                    "mod-upgrade-all",
+                    format!("更新全部 {} 个模组", self.content.upgrades.len()),
+                )
+                .disabled(busy)
+                .on_click(
+                    cx.listener(|h, _, _, cx| h.apply_mod_update(h.content.upgrades.clone(), cx)),
+                ),
+            );
+        }
         if local.loading {
             return list.child(kicker(cx, "正在读取本地模组…"));
         }
@@ -195,7 +301,7 @@ impl Home {
                     Button::new(("local-upgrade", idx), "更新")
                         .disabled(busy)
                         .on_click(
-                            cx.listener(move |h, _, _, cx| h.apply_mod_update(u.clone(), cx)),
+                            cx.listener(move |h, _, _, cx| h.apply_mod_update(vec![u.clone()], cx)),
                         ),
                 );
             }
@@ -207,9 +313,7 @@ impl Home {
                     )
                     .disabled(busy)
                     .on_click(cx.listener(move |h, _, _, cx| {
-                        let result = mods::toggle(&h.root, &h.instances[h.selected], &name);
-                        h.message(result, cx);
-                        h.refresh_mods(cx);
+                        h.toggle_mod(name.clone(), None, cx);
                     })),
                 ),
             );

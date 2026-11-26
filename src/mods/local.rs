@@ -64,7 +64,10 @@ impl LocalMod {
     }
 }
 
-fn entry_text(zip: &mut ZipArchive<File>, name: &str) -> Option<String> {
+pub(super) fn entry_text<R: Read + std::io::Seek>(
+    zip: &mut ZipArchive<R>,
+    name: &str,
+) -> Option<String> {
     let entry = zip.by_name(name).ok()?;
     const LIMIT: u64 = 1024 * 1024;
     if entry.size() > LIMIT {

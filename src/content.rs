@@ -298,6 +298,7 @@ pub fn apply_pack(
         &serde_json::to_vec(state)?,
     )?;
     ensure!(!cancel.load(Ordering::Relaxed), "已取消更新");
+    crate::mods::history::pack_update(&live, tmp.path())?;
     let _library = crate::game::lock_file(&root.join("library.lock"), "实例库正在使用")?;
     recover(root)?;
     if let Some(seen) = merge.review {
@@ -531,6 +532,21 @@ pub fn add_files(root: &Path, item: &Instance, kind: &str, paths: &[PathBuf]) ->
         fs::copy(path, &tmp)?;
         zip::ZipArchive::new(fs::File::open(&tmp)?).context("文件不是有效的 ZIP/JAR")?;
         publish.push((tmp, dest));
+    }
+    if kind == "mods" {
+        let editor = crate::mods::history::Editor::open(root, item)?;
+        let mut edits = crate::mods::history::Edits::new();
+        for (source, dest) in publish {
+            ensure!(!dest.try_exists()?, "同名模组已存在");
+            edits.insert(
+                dest.file_name()
+                    .and_then(|n| n.to_str())
+                    .context("无效文件名")?
+                    .into(),
+                Some(source),
+            );
+        }
+        return editor.commit("添加本地模组", edits);
     }
     let mut created = vec![];
     for (tmp, dest) in publish {

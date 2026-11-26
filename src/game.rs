@@ -1,3 +1,4 @@
+mod verified;
 use std::{
     fs::{self, File},
     io::Write,
@@ -288,28 +289,35 @@ fn prepare_and_play(
     if prefs.authlib && instance.external.is_none() {
         upgrade_cached_authlib(root, &shared, &mut version)?;
     }
-    let java = java::select(
+    let java = java::select_mode(
         &root.join("shared"),
         &version,
         &downloads,
         instance.java_path.as_deref().or(prefs.java.as_deref()),
+        mode == RunMode::Launch,
     )?;
     let mut files = vanilla::plan_vanilla_downloads(&version, &shared)?.tasks;
     if instance.external.is_some() && mode == RunMode::Launch {
         // Existing launchers may use a locally patched client or libraries.
         files.retain(|task| !task.destination.is_file());
     }
-    downloads.batch(&shared, "游戏与运行库", files)?;
+    let mut verified = verified::Index::open(&dir, mode == RunMode::Launch);
+    verified.batch(&downloads, &shared, "游戏与运行库", files, false)?;
     if let Some(index) = &version.asset_index {
         let path = assets::asset_index_path(&shared, &index.id);
         let objects = serde_json::from_slice(&fs::read(path)?)?;
-        downloads.batch(
+        verified.batch(
+            &downloads,
             &shared,
             "声音与游戏资源",
             assets::plan_asset_object_downloads_from_index(&objects, &shared).tasks,
+            true,
         )?;
     }
     downloads.check()?;
+    if let Err(e) = verified.save() {
+        let _ = writeln!(journal, "无法保存快速校验记录：{e}");
+    }
     if mode == RunMode::Stage {
         return Ok(());
     }

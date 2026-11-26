@@ -1,3 +1,5 @@
+pub(crate) mod dependents;
+pub(crate) mod history;
 pub(crate) mod local;
 mod versions;
 use anyhow::{Context, Result, bail, ensure};
@@ -105,21 +107,6 @@ pub fn installed(dir: &Path) -> Result<Vec<String>> {
     Ok(jars)
 }
 
-pub fn toggle(root: &Path, item: &Instance, name: &str) -> Result<()> {
-    let _lock = crate::library::lock_instance(root, item, "实例正在使用")?;
-    let dir = item.game_dir(root)?.join("mods");
-    let base = name.strip_suffix(".disabled").unwrap_or(name);
-    ensure!(jar_name(base), "模组文件名无效");
-    let next = if name == base {
-        format!("{base}.disabled")
-    } else {
-        base.into()
-    };
-    ensure!(!dir.join(&next).exists(), "目标文件已经存在");
-    fs::rename(dir.join(name), dir.join(next))?;
-    Ok(())
-}
-
 pub fn install(
     root: &Path,
     item: &Instance,
@@ -129,13 +116,21 @@ pub fn install(
 ) -> Result<()> {
     let _lock = crate::library::lock_instance(root, item, "实例正在使用")?;
     let downloads = Downloads::new(cancel, &report)?;
-    let mods = item.game_dir(root)?.join("mods");
-    fs::create_dir_all(&mods)?;
-    if let Some(project) = hit.project_id.strip_prefix("cf:") {
-        return install_curse(&mods, item, project.parse()?, None, &downloads);
-    }
-    install_modrinth(&mods, item, &hit.project_id, None, &downloads)
+    let editor = history::Editor::open(root, item)?;
+    edit_install(
+        &editor,
+        &[],
+        &format!("安装模组 · {}", hit.title),
+        |staged| {
+            if let Some(project) = hit.project_id.strip_prefix("cf:") {
+                install_curse(staged, item, project.parse()?, None, &downloads)
+            } else {
+                install_modrinth(staged, item, &hit.project_id, None, &downloads)
+            }
+        },
+    )
 }
+
 pub fn install_pinned(
     mods: &Path,
     item: &Instance,
@@ -435,72 +430,114 @@ pub fn upgrades(root: &Path, item: &Instance, curse: bool) -> Result<Vec<Upgrade
 pub fn upgrade(
     root: &Path,
     item: &Instance,
-    u: &Upgrade,
+    updates: &[Upgrade],
     cancel: &AtomicBool,
     report: impl Fn(String) + Sync,
 ) -> Result<()> {
+    ensure!(!updates.is_empty(), "没有选中更新");
     let _lock = crate::library::lock_instance(root, item, "请先退出游戏")?;
-    let dir = item.game_dir(root)?.join("mods");
     let d = Downloads::new(cancel, &report)?;
-    replace_mod(&dir, &u.old, &u.hash, &u.new, &d, |staged| {
-        if let Some(p) = u.hit.project_id.strip_prefix("cf:") {
-            install_curse(staged, item, p.parse()?, None, &d)
-        } else {
-            install_modrinth(staged, item, &u.hit.project_id, None, &d)
+    let old = updates
+        .iter()
+        .map(|u| (u.old.as_str(), u.hash.as_str(), u.new.as_str()))
+        .collect::<Vec<_>>();
+    let title = if let [u] = updates {
+        format!("更新模组 · {}", u.hit.title)
+    } else {
+        format!("更新 {} 个模组", updates.len())
+    };
+    let editor = history::Editor::open(root, item)?;
+    edit_install(&editor, &old, &title, |staged| {
+        for u in updates {
+            d.check()?;
+            if let Some(p) = u.hit.project_id.strip_prefix("cf:") {
+                install_curse(staged, item, p.parse()?, None, &d)?;
+            } else {
+                install_modrinth(staged, item, &u.hit.project_id, None, &d)?;
+            }
         }
+        d.check()
     })
 }
-
-pub fn replace_pinned(
-    dir: &Path,
+pub fn change_pinned(
+    editor: &history::Editor,
     item: &Instance,
-    old: &crate::market::status::LocalFile,
+    old: Option<&crate::market::status::LocalFile>,
     file: &crate::market::Release,
     d: &Downloads,
 ) -> Result<()> {
     let new = download_name(&file.project, &file.filename)?;
-    replace_mod(dir, &old.name, &old.hash, &new, d, |staged| {
-        install_pinned(staged, item, file, d)
-    })
+    let action = if old.is_some() { "更新" } else { "安装" };
+    edit_install(
+        editor,
+        &old.map(|f| (f.name.as_str(), f.hash.as_str(), new.as_str()))
+            .into_iter()
+            .collect::<Vec<_>>(),
+        &format!("{action}模组 · {}", file.filename),
+        |staged| install_pinned(staged, item, file, d),
+    )
 }
-
-fn replace_mod(
-    dir: &Path,
-    old: &str,
-    hash: &str,
-    new: &str,
-    d: &Downloads,
+fn edit_install(
+    editor: &history::Editor,
+    old: &[(&str, &str, &str)],
+    title: &str,
     install: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
-    ensure!(
-        jar_name(new) && jar_name(old.strip_suffix(".disabled").unwrap_or(old)),
-        "无效的模组文件名"
-    );
-    ensure!(
-        sha1_file(dir.join(old))? == hash,
-        "已安装文件发生变化，请重新检查更新"
-    );
-    let game = dir.parent().context("模组目录无上级")?;
-    let temp = tempfile::tempdir_in(game)?;
-    let staged = temp.path().join("mods");
-    crate::backups::copy_tree(dir, &staged)?;
-    fs::remove_file(staged.join(old))?;
-    install(&staged)?;
-    ensure!(staged.join(new).is_file(), "上游版本已更新，请重新检查");
-    if old.ends_with(".disabled") {
-        fs::rename(staged.join(new), staged.join(format!("{new}.disabled")))?;
+    let stage = tempfile::tempdir_in(&editor.dir)?;
+    let existing = installed(&editor.dir)?;
+    let mut edits = history::Edits::new();
+    let mut outputs = HashSet::new();
+    for &(name, hash, new) in old {
+        ensure!(
+            jar_name(name.strip_suffix(".disabled").unwrap_or(name)) && jar_name(new),
+            "无效的模组文件名"
+        );
+        ensure!(
+            sha1_file(editor.dir.join(name))? == hash,
+            "已安装文件有变化，请重新检查"
+        );
+        ensure!(
+            !existing.iter().any(|f| !f.eq_ignore_ascii_case(name)
+                && f.strip_suffix(".disabled")
+                    .unwrap_or(f)
+                    .eq_ignore_ascii_case(new)),
+            "已安装另一个同名目标：{new}"
+        );
+        ensure!(
+            edits.insert(name.into(), None).is_none() && outputs.insert(new.to_lowercase()),
+            "选中的更新包含重复模组"
+        );
     }
-    d.check()?;
-    let token = uuid::Uuid::new_v4().to_string();
-    crate::library::atomic_write(&game.join(".noctiluca-mod-update"), token.as_bytes())?;
-    let backup = game.join(format!("mods-before-update-{token}"));
-    fs::rename(dir, &backup)?;
-    if let Err(e) = fs::rename(staged, dir) {
-        recover(game)?;
-        return Err(e.into());
+    // The downloaders only add absent files. Linking existing JARs lets them reuse dependencies.
+    for name in &existing {
+        if edits.contains_key(name) {
+            continue;
+        }
+        let from = editor.dir.join(name);
+        let to = stage.path().join(name);
+        if fs::hard_link(&from, &to).is_err() {
+            fs::copy(&from, &to)?;
+        }
     }
-    recover(game)?;
-    Ok(())
+    install(stage.path())?;
+    for &(prior, _, new) in old {
+        ensure!(stage.path().join(new).is_file(), "找不到期望的新版模组");
+        if prior.ends_with(".disabled") {
+            let disabled = format!("{new}.disabled");
+            ensure!(
+                !stage.path().join(&disabled).try_exists()?,
+                "目标停用文件已存在"
+            );
+            fs::rename(stage.path().join(new), stage.path().join(disabled))?;
+        }
+    }
+    let names: HashSet<_> = existing.iter().map(|n| n.to_lowercase()).collect();
+    for file in installed(stage.path())? {
+        if !names.contains(&file.to_lowercase()) || edits.contains_key(&file) {
+            edits.insert(file.clone(), Some(stage.path().join(file)));
+        }
+    }
+    editor.commit(title, edits)
 }
 
 fn download_name(project: &str, raw: &str) -> Result<String> {

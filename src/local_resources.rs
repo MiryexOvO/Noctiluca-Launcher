@@ -301,17 +301,12 @@ impl Plan {
             "实例位置已变更，请重新拖入文件"
         );
         // Different instances can point their mods directories at the same Windows junction.
-        let _mods_lock = if self
+        let editor = if self
             .rows
             .iter()
             .any(|r| !r.skip && r.kind == Some(Kind::Mod))
         {
-            let dir = self.target(Kind::Mod)?;
-            fs::create_dir_all(dir)?;
-            Some(crate::game::lock_file(
-                &dir.join(".noctiluca-import.lock"),
-                "另一个实例正在导入模组，请重试",
-            )?)
+            Some(crate::mods::history::Editor::open(root, &self.item)?)
         } else {
             None
         };
@@ -345,15 +340,35 @@ impl Plan {
             );
             staged.push((tmp, kind, row));
         }
-        let ready = count - staged.len();
-        for (index, (tmp, kind, row)) in staged.into_iter().enumerate() {
-            self.publish(tmp, kind, row).with_context(|| {
-                format!(
-                    "已有 {} / {count} 个文件就绪，写入「{}」失败。处理后可重新安装。",
-                    ready + index,
-                    row.name
-                )
-            })?;
+        let mut ready = count - staged.len();
+        let mut edits = crate::mods::history::Edits::new();
+        let mut keep = vec![];
+        for (tmp, kind, row) in staged {
+            if kind == Kind::Mod {
+                if let Some(old) = row
+                    .check
+                    .as_ref()
+                    .and_then(|c| c.old.as_ref())
+                    .filter(|old| !old.name.eq_ignore_ascii_case(row.output()))
+                {
+                    edits.insert(old.name.clone(), None);
+                }
+                edits.insert(row.output().into(), Some(tmp.path().to_owned()));
+                keep.push(tmp);
+            } else {
+                self.publish(tmp, kind, row).with_context(|| {
+                    format!(
+                        "已有 {} / {count} 个文件就绪，写入「{}」失败",
+                        ready, row.name
+                    )
+                })?;
+                ready += 1;
+            }
+        }
+        if let Some(editor) = editor {
+            editor
+                .commit("拖入本地模组", edits)
+                .with_context(|| format!("已有 {ready} / {count} 个文件就绪，模组改动未完成"))?;
         }
         Ok(count)
     }
@@ -363,27 +378,6 @@ impl Plan {
         let dest = dir.join(row.output());
         if fingerprint(dir, row.output())?.as_deref() != row.existing() {
             bail!("目标已变更，请重新检查：{}", row.name)
-        }
-        if let Some(old) = row
-            .check
-            .as_ref()
-            .and_then(|c| c.old.as_ref())
-            .filter(|old| !old.name.eq_ignore_ascii_case(row.output()))
-        {
-            ensure!(
-                row.replace
-                    && row.existing().is_none()
-                    && fingerprint(dir, &old.name)?.as_ref() == Some(&old.hash),
-                "原模组或目标文件已变化"
-            );
-            let previous = dir.join(&old.name);
-            // Keep exactly one loadable JAR even if the process stops between rename and replacement.
-            mod_check::move_new(&previous, &dest)?;
-            if let Err(e) = tmp.persist(&dest) {
-                mod_check::move_new(&dest, &previous).context("旧版仍在新文件名下，请重新检查")?;
-                return Err(e.error.into());
-            }
-            return Ok(());
         }
         if row.replace && row.conflict() {
             tmp.persist(&dest)?;
