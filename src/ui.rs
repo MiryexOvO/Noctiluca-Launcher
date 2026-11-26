@@ -10,6 +10,7 @@ mod local_resources;
 mod manager;
 mod motion;
 mod pack_import;
+mod pack_tasks;
 mod players;
 mod preferences;
 mod project_icon;
@@ -67,7 +68,7 @@ enum Update {
     Exited(String, Result<()>, bool),
     Imported(Box<Instance>),
     Changed(Box<Instance>),
-    PackPreview(Result<(PathBuf, Box<crate::packs::Preview>)>, bool),
+    PackPreview(Result<Box<crate::packs::Preview>>, bool),
     PackPrefetched(Result<()>),
     PackFinished(Result<()>, Option<String>),
     Status(String),
@@ -79,6 +80,7 @@ pub struct Home {
     content: content::Tools,
     profiles: players::Profiles,
     draft: Option<pack_import::Draft>,
+    tasks: pack_tasks::Shelf,
     controls: instance_controls::Controls,
     navigation: motion::Navigation,
     _motion_preference: Subscription,
@@ -166,6 +168,7 @@ impl Home {
             content: Default::default(),
             profiles: players::Profiles::new(window, cx),
             draft: None,
+            tasks: pack_tasks::Shelf::new(&root, window.window_handle()),
             controls: instance_controls::Controls::new(&root),
             navigation: Default::default(),
             _motion_preference: cx.observe_window_activation(window, |home, window, cx| {
@@ -232,6 +235,9 @@ impl Home {
     }
 
     fn can_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.copying && self.running.is_empty() && self.pause_pack_on_close(cx) {
+            return false;
+        }
         let reason = if self.copying {
             "正在写入文件，请稍候"
         } else if !self.running.is_empty() {
@@ -1463,7 +1469,31 @@ impl Render for Home {
                                             || self.logging_in
                                             || self.searching
                                             || self.hub.loading,
-                                        |el| el.child(motion::task_progress(&self.status)),
+                                        |el| {
+                                            el.child(
+                                                div()
+                                                    .id("expand-pack-progress")
+                                                    .when(
+                                                        self.tasks.is_working(self.cancel.as_ref()),
+                                                        |row| {
+                                                            row.cursor_pointer().on_click(
+                                                                cx.listener(|h, _, _, cx| {
+                                                                    h.tasks.expanded =
+                                                                        !h.tasks.expanded;
+                                                                    h.reload_jobs(cx);
+                                                                }),
+                                                            )
+                                                        },
+                                                    )
+                                                    .child(motion::task_progress(&self.status)),
+                                            )
+                                        },
+                                    )
+                                    .when(
+                                        !self.tasks.records.is_empty()
+                                            || self.tasks.active.is_some()
+                                            || self.tasks.error.is_some(),
+                                        |el| el.child(self.task_shelf(cx)),
                                     )
                                     .when_some(self.prefs.link.clone(), |el, url: String| {
                                         el.child(

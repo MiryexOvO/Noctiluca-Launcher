@@ -1,3 +1,4 @@
+mod review;
 use super::*;
 use crate::packs::Preview;
 use ely_gpui_component::{buttons::ButtonVariant, forms::Checkbox, primitives::Tooltip};
@@ -13,9 +14,13 @@ enum FileSelection {
 pub(super) struct Draft {
     queue_drops: bool,
     queued_paths: Vec<PathBuf>,
-    pack: Arc<Preview>,
-    path: PathBuf,
-    optional: HashSet<usize>,
+    pub(super) pack: Arc<Preview>,
+    review: Option<Arc<crate::content::review::Review>>,
+    review_error: Option<String>,
+    review_revision: u64,
+    detail_open: bool,
+    choices: crate::content::review::Choices,
+    pub(super) optional: HashSet<usize>,
     supplied: HashSet<usize>,
     failed_file: Option<usize>,
     missing_page: usize,
@@ -24,10 +29,10 @@ pub(super) struct Draft {
 }
 
 impl Draft {
-    fn selected(&self, i: usize) -> bool {
+    pub(super) fn selected(&self, i: usize) -> bool {
         !self.pack.files[i].optional() || self.optional.contains(&i)
     }
-    fn missing(&self, i: usize) -> bool {
+    pub(super) fn missing(&self, i: usize) -> bool {
         self.selected(i) && !self.supplied.contains(&i) && self.pack.files[i].automatic.is_none()
     }
 }
@@ -80,43 +85,79 @@ impl Home {
 
     pub(super) fn preview_ready(
         &mut self,
-        result: Result<(PathBuf, Box<Preview>)>,
+        result: Result<Box<Preview>>,
         dropped: bool,
         cx: &mut Context<Self>,
     ) {
-        self.cancel = None;
+        let paused = self
+            .cancel
+            .take()
+            .is_some_and(|c| c.load(Ordering::Relaxed));
+        if paused {
+            self.failed = false;
+            self.status = "整合包任务已暂停，可以从下载任务继续".into();
+            cx.notify();
+            return;
+        }
         match result {
-            Ok((path, pack)) => {
-                let selected = if let Some(item) = &pack.target {
+            Ok(pack) => {
+                let record = pack.job.as_ref().unwrap().record();
+                let selected = if let Some(paths) = &record.optional {
+                    pack.files
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, f)| (f.optional() && paths.contains(&f.path)).then_some(i))
+                        .collect()
+                } else if let Some(item) = &pack.target {
                     crate::content::previous_options(&self.root, item, &pack)
                 } else {
                     HashSet::new()
                 };
+                let supplied = pack.cached();
+                let failed_file = record.failed.as_ref().and_then(|p| {
+                    pack.files
+                        .iter()
+                        .position(|f| &f.path == p)
+                        .filter(|i| !supplied.contains(i))
+                });
                 self.draft = Some(Draft {
                     queue_drops: false,
                     queued_paths: Vec::new(),
                     pack: Arc::from(pack),
-                    path,
+                    review: None,
+                    review_error: None,
+                    review_revision: 0,
+                    detail_open: false,
+                    choices: record.choices,
                     optional: selected,
-                    supplied: HashSet::new(),
-                    failed_file: None,
+                    supplied,
+                    failed_file,
                     missing_page: 0,
                     optional_page: 0,
                     optional_open: false,
                 });
+                self.reload_jobs(cx);
+                self.refresh_review(cx);
                 self.status = "整合包预览已就绪".into();
                 self.failed = false;
                 let draft = self.draft.as_ref().unwrap();
-                if crate::preferences::current().quick == 1
+                if self.tasks.closing {
+                    cx.notify();
+                    return;
+                }
+                let quick = crate::preferences::current().quick == 1
                     && (dropped || draft.pack.upstream.is_some())
+                    && draft.pack.optional_count == 0;
+                if (record.confirmed || quick)
+                    && draft.failed_file.is_none()
                     && draft.pack.target.is_none()
                     && draft.pack.metadata_error.is_none()
                     && draft.pack.optional_error.is_none()
-                    && draft.pack.optional_count == 0
                     && !(0..draft.pack.files.len()).any(|i| draft.missing(i))
                 {
-                    self.confirm_pack(false, cx);
-                } else if dropped
+                    self.confirm_pack(record.confirmed && record.launch, cx);
+                } else if (dropped || record.prefetch)
+                    && draft.failed_file.is_none()
                     && draft.pack.metadata_error.is_none()
                     && draft
                         .pack
@@ -127,6 +168,7 @@ impl Home {
                     let pack = draft.pack.clone();
                     self.draft.as_mut().unwrap().queue_drops = true;
                     let cancel = Arc::new(AtomicBool::new(false));
+                    self.tasks.track(&cancel);
                     self.cancel = Some(cancel.clone());
                     self.status = "正在预下载整合包必需文件".into();
                     let (tx, rx) = async_channel::unbounded();
@@ -153,10 +195,27 @@ impl Home {
         {
             return;
         }
+        if draft.pack.target.is_some() && draft.review.is_none() {
+            return;
+        }
+        if let Err(e) = draft.persist_options() {
+            self.message(Err(e), cx);
+            return;
+        }
+        if let Err(e) = draft.pack.job.as_ref().unwrap().change(|r| {
+            r.confirmed = true;
+            r.launch = launch;
+        }) {
+            self.message(Err(e), cx);
+            return;
+        }
+        let review = draft.review.clone();
+        let choices = draft.choices.clone();
         let pack = draft.pack.clone();
         let optional = draft.optional.clone();
         let root = self.root.clone();
         let cancel = Arc::new(AtomicBool::new(false));
+        self.tasks.track(&cancel);
         self.cancel = Some(cancel.clone());
         self.failed = false;
         self.status = "正在安装整合包文件".into();
@@ -173,17 +232,21 @@ impl Home {
                 } else {
                     None
                 };
-                let item = if let Some(pin) = &prepared {
-                    pack.install_prepared(&root, &optional, &cancel, report, pin.as_deref())?
-                } else {
-                    pack.install(&root, &optional, &cancel, report)?
-                };
+                let item = pack.install_prepared(
+                    &root,
+                    &optional,
+                    &cancel,
+                    report,
+                    prepared.as_ref().and_then(|p| p.as_deref()),
+                    review.as_ref().map(|r| (r.as_ref(), &choices)),
+                )?;
+                let job = pack.job.as_ref().unwrap();
+                job.change(|r| r.committed = true)?;
                 let _ = tx.try_send(Update::Imported(Box::new(item.clone())));
-                if prepared.is_some() {
-                    Ok(())
-                } else {
-                    game::play(&root, &item, None, true, &cancel, report)
+                if prepared.is_none() {
+                    game::play(&root, &item, None, true, &cancel, report)?;
                 }
+                job.finish()
             })();
             let _ = tx.try_send(Update::PackFinished(
                 result,
@@ -199,7 +262,16 @@ impl Home {
         launch: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.cancel = None;
+        let paused = self
+            .cancel
+            .take()
+            .is_some_and(|c| c.load(Ordering::Relaxed));
+        if paused && result.is_err() {
+            self.failed = false;
+            self.status = "整合包任务已暂停，下次可以继续安装".into();
+            cx.notify();
+            return;
+        }
         match result {
             Err(err) => {
                 if let Some(draft) = &mut self.draft
@@ -208,12 +280,26 @@ impl Home {
                     draft.failed_file = draft.pack.files.iter().position(|f| f.path == file.label);
                     draft.missing_page = 0;
                 }
+                if let Some(d) = &self.draft
+                    && let Some(i) = d.failed_file
+                    && let Some(j) = &d.pack.job
+                {
+                    let path = d.pack.files[i].path.clone();
+                    if let Err(e) = j.change(|r| r.failed = Some(path)) {
+                        self.message(Err(e), cx);
+                        return;
+                    }
+                }
                 self.message(Err(err), cx);
             }
             Ok(()) => {
                 self.failed = false;
+                self.draft = None;
+                self.tasks.active = None;
+                self.reload_jobs(cx);
                 self.status = "整合包、游戏与加载器已安装".into();
-                if let Some(id) = launch
+                if !self.tasks.closing
+                    && let Some(id) = launch
                     && let Some(i) = self.instances.iter().position(|item| item.id == id)
                 {
                     self.show_instance(i, cx);
@@ -232,6 +318,10 @@ impl Home {
             Ok(()) => {
                 self.failed = false;
                 self.status = "可自动下载的必需文件已就绪".into();
+            }
+            Err(_) if cancelled => {
+                self.failed = false;
+                self.status = "整合包任务已暂停".into();
             }
             Err(e) => self.pack_finished(Err(e), None, cx),
         }
@@ -307,6 +397,7 @@ impl Home {
         let optional = draft.optional.clone();
         draft.queue_drops = true;
         let cancel = Arc::new(AtomicBool::new(false));
+        self.tasks.track(&cancel);
         self.cancel = Some(cancel.clone());
         self.failed = false;
         self.status = "正在按整合包清单匹配本地文件…".into();
@@ -381,6 +472,7 @@ impl Home {
 
     fn supply_file(&mut self, pack: Arc<Preview>, i: usize, path: PathBuf, cx: &mut Context<Self>) {
         let cancel = Arc::new(AtomicBool::new(false));
+        self.tasks.track(&cancel);
         self.cancel = Some(cancel.clone());
         self.status = format!("正在校验 {}", pack.files[i].path);
         self.failed = false;
@@ -516,20 +608,18 @@ impl Home {
                 cx,
                 "按当前选中的清单文件统计。基础游戏、加载器和 Java 在安装时单独检查。",
             )));
+            if pack.target.is_some() {
+                body = body.child(self.review_panel(draft, busy, cx));
+            }
             if let Some(error) = &pack.metadata_error {
                 body = body.child(panel(cx, "无法读取依赖文件信息").child(error.clone()));
-                let path = draft.path.clone();
-                let origin = pack.upstream.clone();
-                let target = pack.target.clone();
+                let id = pack.instance.id.clone();
                 footer = footer.child(
                     Button::new("retry-manifest", "重新读取清单")
                         .primary()
                         .disabled(busy)
                         .on_click(cx.listener(move |h, _, _, cx| {
-                            h.install_pack(
-                                hub::Pack::Retry(path.clone(), origin.clone(), target.clone()),
-                                cx,
-                            )
+                            h.install_pack(hub::Pack::Resume(id.clone()), cx)
                         })),
                 );
             } else {
@@ -557,7 +647,12 @@ impl Home {
                     && !draft.supplied.contains(&i)
                 {
                     body = body.child(
-                        panel(cx, "下载失败，可重新安装或手动补齐")
+                        panel(cx, "下载失败")
+                            .child(
+                                Button::new("retry-pack-file", "重试这个文件")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |h, _, _, cx| h.retry_one(i, cx))),
+                            )
                             .child(self.missing_file_row(draft, i, true, busy, cx)),
                     );
                 }
@@ -584,7 +679,7 @@ impl Home {
                                     "仅安装"
                                 },
                             )
-                            .disabled(busy)
+                            .disabled(busy || (pack.target.is_some() && draft.review.is_none()))
                             .on_click(cx.listener(|h, _, _, cx| h.confirm_pack(false, cx))),
                         )
                         .child(
@@ -597,7 +692,7 @@ impl Home {
                                 },
                             )
                             .primary()
-                            .disabled(busy)
+                            .disabled(busy || (pack.target.is_some() && draft.review.is_none()))
                             .on_click(cx.listener(|h, _, _, cx| h.confirm_pack(true, cx))),
                         );
                 }
@@ -705,6 +800,8 @@ impl Home {
                                             }
                                             d.missing_page = 0;
                                         }
+                                        h.save_options(cx);
+                                        h.refresh_review(cx);
                                         cx.notify();
                                     });
                                 }),

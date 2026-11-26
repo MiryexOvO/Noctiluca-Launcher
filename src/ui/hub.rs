@@ -6,9 +6,9 @@ use anyhow::Context as _;
 pub(super) enum Pack {
     Local(PathBuf),
     Dropped(PathBuf),
-    UpdateLocal(PathBuf, Instance),
-    UpdateOnline(Release, Instance),
-    Retry(PathBuf, Option<crate::content::Upstream>, Option<Instance>),
+    UpdateLocal(PathBuf, String),
+    UpdateOnline(Release, String),
+    Resume(String),
     Online(Release),
 }
 
@@ -159,9 +159,59 @@ impl Home {
                 .and_then(|p| p.icon_url.clone()),
             _ => None,
         };
+        use crate::packs::jobs::{Job, Source as Archive};
+        let dropped = matches!(&pack, Pack::Dropped(_));
+        let task = match pack {
+            Pack::Resume(id) => self
+                .tasks
+                .active
+                .as_ref()
+                .filter(|j| j.record().id == id)
+                .cloned()
+                .map_or_else(|| Job::open(&self.root, &id), Ok),
+            Pack::Local(path) | Pack::Dropped(path) => {
+                Job::create(&self.root, Archive::Local(path), None, None)
+            }
+            Pack::UpdateLocal(path, item) => {
+                Job::create(&self.root, Archive::Local(path), None, Some(item))
+            }
+            Pack::Online(file) => {
+                let mut origin = crate::content::Upstream::from(&file);
+                origin.icon_url = project_icon;
+                Job::create(
+                    &self.root,
+                    Archive::Online(Box::new(file)),
+                    Some(origin),
+                    None,
+                )
+            }
+            Pack::UpdateOnline(file, item) => {
+                let origin = crate::content::Upstream::from(&file);
+                Job::create(
+                    &self.root,
+                    Archive::Online(Box::new(file)),
+                    Some(origin),
+                    Some(item),
+                )
+            }
+        };
+        let job = match task {
+            Ok(j) => j,
+            Err(e) => {
+                self.message(Err(e), cx);
+                return;
+            }
+        };
+        if dropped && let Err(e) = job.change(|r| r.prefetch = true) {
+            self.message(Err(e), cx);
+            return;
+        }
         self.draft = None;
+        self.tasks.active = Some(job.clone());
+        self.reload_jobs(cx);
         let root = self.root.clone();
         let cancel = Arc::new(AtomicBool::new(false));
+        self.tasks.track(&cancel);
         self.cancel = Some(cancel.clone());
         self.page = Page::Import;
         self.failed = false;
@@ -171,37 +221,41 @@ impl Home {
             let report = |s| {
                 let _ = tx.try_send(Update::Status(s));
             };
-            let dropped = matches!(&pack, Pack::Dropped(_));
             let result = (|| -> Result<_> {
-                let mut retry_origin = None;
-                let (file, target) = match pack {
-                    Pack::Retry(path, origin, target) => {
-                        retry_origin = origin;
-                        (Ok(path), target)
+                let record = job.record();
+                if let Some(item) = job.instance(&root)? {
+                    let _ = tx.try_send(Update::Imported(Box::new(item.clone())));
+                    if record.target.is_none() {
+                        game::play(&root, &item, None, true, &cancel, report)?;
                     }
-                    Pack::Local(path) | Pack::Dropped(path) => (Ok(path), None),
-                    Pack::UpdateLocal(path, item) => (Ok(path), Some(item)),
-                    Pack::Online(file) => (Err(file), None),
-                    Pack::UpdateOnline(file, item) => (Err(file), Some(item)),
-                };
-                let (path, upstream) = match file {
-                    Ok(path) => (path, None),
-                    Err(file) => {
-                        let mut origin = crate::content::Upstream::from(&file);
-                        origin.icon_url = project_icon;
-                        (
-                            file.archive(&root, &Downloads::new(&cancel, &report)?)?,
-                            Some(origin),
-                        )
-                    }
-                };
-                let mut preview = crate::packs::preview(&root, &path)?;
-                preview.upstream = upstream.or(retry_origin);
-                preview.target = target;
-                anyhow::ensure!(!cancel.load(Ordering::Relaxed), "已取消预览");
-                Ok((path, Box::new(preview)))
+                    job.finish()?;
+                    return Ok(None);
+                }
+                let path = job.archive(&root, &Downloads::new(&cancel, &report)?)?;
+                let mut preview =
+                    crate::packs::preview_job(&root, &path, Some(job.clone()), &cancel)?;
+                if let Some(id) = &record.target {
+                    ensure!(library::safe_id(id), "实例 ID 无效");
+                    let target: Instance = serde_json::from_slice(
+                        &fs::read(root.join("instances").join(id).join("instance.json"))
+                            .map_err(|e| anyhow::anyhow!("无法读取要更新的实例：{e}"))?,
+                    )?;
+                    ensure!(&target.id == id, "目标实例已变更");
+                    preview.target = Some(target);
+                }
+                preview.upstream = record.origin;
+                job.change(|r| r.title = preview.instance.name.clone())?;
+                ensure!(!cancel.load(Ordering::Relaxed), "已暂停任务");
+                Ok(Some(Box::new(preview)))
             })();
-            let _ = tx.try_send(Update::PackPreview(result, dropped));
+            let update = match result {
+                Ok(None) => {
+                    let r = job.record();
+                    Update::PackFinished(Ok(()), r.launch.then(|| r.target.unwrap_or(r.id)))
+                }
+                other => Update::PackPreview(other.map(|v| v.unwrap()), dropped),
+            };
+            let _ = tx.try_send(update);
         });
         self.listen(rx, cx);
     }

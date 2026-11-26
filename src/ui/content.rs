@@ -357,7 +357,7 @@ impl Home {
             let _ = view.update(cx, |h, cx| match choice {
                 Ok(Ok(Some(paths))) => {
                     if let Some(p) = paths.first() {
-                        h.install_pack(hub::Pack::UpdateLocal(p.clone(), item), cx);
+                        h.install_pack(hub::Pack::UpdateLocal(p.clone(), item.id), cx);
                     }
                 }
                 Ok(Err(e)) => h.message(Err(e), cx),
@@ -578,7 +578,7 @@ impl Home {
                     Button::new(("update-release", i), r.name.clone())
                         .disabled(busy)
                         .on_click(cx.listener(move |h, _, _, cx| {
-                            h.install_pack(hub::Pack::UpdateOnline(r.clone(), item.clone()), cx)
+                            h.install_pack(hub::Pack::UpdateOnline(r.clone(), item.id.clone()), cx)
                         })),
                 );
             }

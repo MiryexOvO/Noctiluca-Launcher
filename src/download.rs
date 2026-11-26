@@ -82,7 +82,7 @@ impl<'a> Downloads<'a> {
     }
 
     pub fn batch(&self, root: &Path, title: &str, tasks: Vec<DownloadTask>) -> Result<()> {
-        self.batch_with(root, title, tasks, |_| Ok(()))
+        self.batch_with(root, title, tasks, |_| {}, |_| Ok(()))
     }
 
     pub fn batch_with(
@@ -90,6 +90,7 @@ impl<'a> Downloads<'a> {
         root: &Path,
         title: &str,
         tasks: Vec<DownloadTask>,
+        started: impl Fn(&DownloadTask) + Sync,
         completed: impl Fn(&DownloadTask) -> Result<()> + Sync,
     ) -> Result<()> {
         self.check()?;
@@ -112,18 +113,33 @@ impl<'a> Downloads<'a> {
         }
         let total = unique.len();
         (self.report)(format!("{title} · 0 / {total}"));
-        let progress = Mutex::new((0usize, Instant::now()));
+        let progress = Mutex::new((0usize, None::<Instant>));
         self.pool.install(|| {
             unique.par_iter().try_for_each(|task| -> Result<()> {
                 self.check()?;
+                started(task);
+                {
+                    let mut state = progress.lock().unwrap();
+                    if state
+                        .1
+                        .is_none_or(|last| last.elapsed() >= Duration::from_millis(350))
+                    {
+                        (self.report)(format!("{title} · {} · {} / {total}", task.label, state.0));
+                        state.1 = Some(Instant::now());
+                    }
+                }
                 self.file(root, task)
                     .and_then(|()| completed(task))
                     .with_context(|| FileFailure::new(title, &task.label))?;
                 let mut state = progress.lock().unwrap();
                 state.0 += 1;
-                if state.0 == total || state.1.elapsed() >= Duration::from_millis(350) {
+                if state.0 == total
+                    || state
+                        .1
+                        .is_none_or(|last| last.elapsed() >= Duration::from_millis(350))
+                {
                     (self.report)(format!("{title} · {} / {total}", state.0));
-                    state.1 = Instant::now();
+                    state.1 = Some(Instant::now());
                 }
                 Ok(())
             })

@@ -1,3 +1,4 @@
+pub(crate) mod jobs;
 mod supply;
 pub(crate) use supply::is_pack_archive;
 
@@ -29,7 +30,7 @@ struct Index {
     dependencies: HashMap<String, String>,
     files: Vec<PackFile>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 pub(crate) struct PackFile {
     pub(crate) path: String,
     #[serde(rename = "fileSize")]
@@ -269,8 +270,12 @@ pub struct Preview {
     pub optional_count: usize,
     archive: File,
     prefixes: Vec<String>,
-    cache: tempfile::TempDir,
+    cache: PathBuf,
+    _scratch: Option<tempfile::TempDir>,
+    pub job: Option<std::sync::Arc<jobs::Job>>,
+    overrides: std::collections::BTreeMap<String, String>,
     cached_sizes: std::sync::Mutex<Vec<Option<u64>>>,
+    pub active_files: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl PackFile {
@@ -305,7 +310,46 @@ impl PackFile {
     }
 }
 
-pub fn preview(root: &Path, path: &Path) -> Result<Preview> {
+fn resolve_curse(
+    job: Option<&jobs::Job>,
+    requirements: &[crate::curse::Requirement],
+    required: bool,
+) -> Result<Vec<PackFile>> {
+    let Some(job) = job else {
+        return crate::curse::resolve(requirements, required);
+    };
+    let path = job.dir.join(if required {
+        "curse-required.json"
+    } else {
+        "curse-optional.json"
+    });
+    if let Ok(input) = File::open(&path)
+        && let Ok(rows) = serde_json::from_reader::<_, Vec<(PackFile, Option<String>)>>(input)
+    {
+        return Ok(rows
+            .into_iter()
+            .map(|(mut file, site)| {
+                file.website = site.filter(|s| {
+                    Url::parse(s).is_ok_and(|u| {
+                        u.scheme() == "https" && u.host_str() == Some("www.curseforge.com")
+                    })
+                });
+                file
+            })
+            .collect());
+    }
+    let files = crate::curse::resolve(requirements, required)?;
+    let rows = files.iter().map(|f| (f, &f.website)).collect::<Vec<_>>();
+    crate::library::atomic_write(&path, &serde_json::to_vec(&rows)?)?;
+    Ok(files)
+}
+
+pub fn preview_job(
+    root: &Path,
+    path: &Path,
+    job: Option<std::sync::Arc<jobs::Job>>,
+    cancel: &AtomicBool,
+) -> Result<Preview> {
     let mut zip = ZipArchive::new(File::open(path).context("无法打开所选整合包")?)
         .context("无法读取整合包压缩文件")?;
     let multi = zip
@@ -324,12 +368,12 @@ pub fn preview(root: &Path, path: &Path) -> Result<Preview> {
     if let Some(ref requirements) = curse {
         required_count = requirements.iter().filter(|f| f.required()).count();
         optional_count = requirements.len() - required_count;
-        match crate::curse::resolve(requirements, true) {
+        match resolve_curse(job.as_deref(), requirements, true) {
             Ok(files) => index.files = files,
             Err(e) => metadata_error = Some(format!("{e:#}")),
         }
         if metadata_error.is_none() {
-            match crate::curse::resolve(requirements, false) {
+            match resolve_curse(job.as_deref(), requirements, false) {
                 Ok(files) => index.files.extend(files),
                 Err(e) => optional_error = Some(format!("{e:#}")),
             }
@@ -389,8 +433,56 @@ pub fn preview(root: &Path, path: &Path) -> Result<Preview> {
         optional_count = files.iter().filter(|f| f.optional()).count();
         required_count = files.len() - optional_count;
     }
-    Ok(Preview {
+    let scratch = if job.is_none() {
+        Some(tempfile::tempdir_in(root)?)
+    } else {
+        None
+    };
+    let cache = if let Some(j) = &job {
+        j.dir.join("files")
+    } else {
+        scratch.as_ref().unwrap().path().to_owned()
+    };
+    fs::create_dir_all(&cache)?;
+    let mut overrides = std::collections::BTreeMap::new();
+    if job.as_ref().is_some_and(|j| j.record().target.is_some()) {
+        for prefix in &prefixes {
+            for i in 0..zip.len() {
+                let mut entry = zip.by_index(i)?;
+                let Some(rel) = entry.name().strip_prefix(prefix).map(str::to_owned) else {
+                    continue;
+                };
+                if entry.is_dir() || rel.is_empty() {
+                    continue;
+                }
+                relative(&rel)?;
+                ensure!(!entry.is_symlink(), "整合包包含符号链接");
+                if !crate::content::review::relevant(&rel) {
+                    continue;
+                }
+                let mut digest = sha1::Sha1::new();
+                let mut buf = [0u8; 64 * 1024];
+                loop {
+                    ensure!(
+                        !cancel.load(std::sync::atomic::Ordering::Relaxed),
+                        "已暂停任务"
+                    );
+                    let n = entry.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    digest.update(&buf[..n]);
+                }
+                overrides.insert(rel, hex::encode(digest.finalize()));
+            }
+        }
+    }
+    if let Some(j) = &job {
+        instance.id = j.record().id;
+    }
+    let preview = Preview {
         cached_sizes: std::sync::Mutex::new(vec![None; files.len()]),
+        active_files: Default::default(),
         instance,
         files,
         curse: curse.is_some(),
@@ -414,8 +506,13 @@ pub fn preview(root: &Path, path: &Path) -> Result<Preview> {
         optional_count,
         archive: zip.into_inner(),
         prefixes,
-        cache: tempfile::tempdir_in(root)?,
-    })
+        cache,
+        _scratch: scratch,
+        job,
+        overrides,
+    };
+    preview.restore_cache(cancel)?;
+    Ok(preview)
 }
 
 #[derive(Default)]
@@ -456,9 +553,83 @@ impl Preview {
     }
 
     fn cache_path(&self, index: usize) -> PathBuf {
-        self.cache.path().join(index.to_string())
+        let file = &self.files[index];
+        self.cache.join(format!(
+            "{}-{}",
+            file.hashes["sha1"].to_ascii_lowercase(),
+            hex::encode(sha1::Sha1::digest(file.path.as_bytes()))
+        ))
     }
 
+    fn restore_cache(&self, cancel: &AtomicBool) -> Result<()> {
+        for (i, f) in self.files.iter().enumerate() {
+            ensure!(
+                !cancel.load(std::sync::atomic::Ordering::Relaxed),
+                "已暂停任务"
+            );
+            let path = self.cache_path(i);
+            if !path.try_exists()? {
+                continue;
+            }
+            if mc_launcher_core::io::hash::sha1_file(&path)?.eq_ignore_ascii_case(&f.hashes["sha1"])
+                && self.check_sha512(f, &path, cancel).is_ok()
+            {
+                self.cached_sizes.lock().unwrap()[i] = Some(fs::metadata(path)?.len());
+            } else {
+                ensure!(
+                    !cancel.load(std::sync::atomic::Ordering::Relaxed),
+                    "已暂停任务"
+                );
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+    pub fn cached(&self) -> HashSet<usize> {
+        self.cached_sizes
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| n.is_some().then_some(i))
+            .collect()
+    }
+    pub fn review(
+        &self,
+        root: &Path,
+        optional: &HashSet<usize>,
+    ) -> Result<crate::content::review::Review> {
+        let item = self.target.as_ref().context("请选择要更新的实例")?;
+        ensure!(item.external.is_none(), "原地更新仅支持启动器管理的实例");
+        let old = crate::content::PackState::read(&item.path(root))?;
+        let mut files = std::collections::BTreeMap::new();
+        for (i, file) in self.files.iter().enumerate() {
+            if !file.optional() || optional.contains(&i) {
+                files.insert(
+                    file.path.to_lowercase(),
+                    (file.path.clone(), file.hashes["sha1"].to_ascii_lowercase()),
+                );
+            }
+        }
+        for (rel, hash) in &self.overrides {
+            files
+                .entry(rel.to_lowercase())
+                .or_insert_with(|| (rel.clone(), String::new()))
+                .1 = hash.clone();
+        }
+        let next = files.into_values().collect();
+        crate::content::review::Review::build(&item.game_dir(root)?, old.as_ref(), &next)
+    }
+    pub fn retry_file(
+        &self,
+        index: usize,
+        cancel: &AtomicBool,
+        report: &(dyn Fn(String) + Sync),
+    ) -> Result<()> {
+        let file = self.files.get(index).context("文件已变化")?;
+        ensure!(file.automatic.is_some(), "请手动补齐文件");
+        self.cache_files(&self.downloads(cancel, report)?, &[(index, file)])
+    }
     fn check_sha512(&self, file: &PackFile, path: &Path, cancel: &AtomicBool) -> Result<()> {
         if let Some(expected) = file.hashes.get("sha512") {
             let mut hash = Sha512::new();
@@ -522,12 +693,27 @@ impl Preview {
             .iter()
             .map(|(i, f)| (f.path.as_str(), *i))
             .collect();
-        downloads.batch_with(self.cache.path(), "整合包文件", tasks, |task| {
-            let i = indices[task.label.as_str()];
-            self.check_sha512(&self.files[i], &task.destination, downloads.cancel)?;
-            self.cached_sizes.lock().unwrap()[i] = Some(fs::metadata(&task.destination)?.len());
-            Ok(())
-        })
+        let result = downloads.batch_with(
+            &self.cache,
+            "整合包文件",
+            tasks,
+            |task| {
+                let mut active = self.active_files.lock().unwrap();
+                if active.is_empty() {
+                    (downloads.report)(format!("正在获取 {}", task.label));
+                }
+                active.insert(task.label.clone());
+            },
+            |task| {
+                self.active_files.lock().unwrap().remove(&task.label);
+                let i = indices[task.label.as_str()];
+                self.check_sha512(&self.files[i], &task.destination, downloads.cancel)?;
+                self.cached_sizes.lock().unwrap()[i] = Some(fs::metadata(&task.destination)?.len());
+                Ok(())
+            },
+        );
+        self.active_files.lock().unwrap().clear();
+        result
     }
 
     pub fn prefetch(&self, cancel: &AtomicBool, report: &(dyn Fn(String) + Sync)) -> Result<()> {
@@ -541,16 +727,6 @@ impl Preview {
         self.cache_files(&downloads, &required)
     }
 
-    pub fn install(
-        &self,
-        root: &Path,
-        optional: &HashSet<usize>,
-        cancel: &AtomicBool,
-        report: impl Fn(String) + Sync,
-    ) -> Result<Instance> {
-        self.install_prepared(root, optional, cancel, report, None)
-    }
-
     pub fn install_prepared(
         &self,
         root: &Path,
@@ -558,6 +734,10 @@ impl Preview {
         cancel: &AtomicBool,
         report: impl Fn(String) + Sync,
         pin: Option<&[u8]>,
+        reviewed: Option<(
+            &crate::content::review::Review,
+            &crate::content::review::Choices,
+        )>,
     ) -> Result<Instance> {
         if let Some(error) = &self.metadata_error {
             bail!("{error}");
@@ -578,7 +758,12 @@ impl Preview {
             downloads.check()?;
             let cached = self.cache_path(i);
             if file.automatic.is_none() {
-                self.check_sha512(file, &cached, cancel)?;
+                ensure!(
+                    mc_launcher_core::io::hash::sha1_file(&cached)?
+                        .eq_ignore_ascii_case(&file.hashes["sha1"]),
+                    "手动文件校验失败：{}",
+                    file.path
+                );
             }
 
             self.check_sha512(file, &cached, cancel)
@@ -625,7 +810,24 @@ impl Preview {
             fs::write(temp.path().join("loader.json"), pin)?;
         }
         if let Some(target) = &self.target {
-            return crate::content::apply_pack(root, target, instance, temp.path(), &state, cancel);
+            let empty = Default::default();
+            let merge = crate::content::Merge {
+                review: reviewed.map(|(r, _)| r),
+                choices: reviewed.map_or(&empty, |(_, c)| c),
+                task: self.job.as_ref().map(|_| instance.id.as_str()),
+            };
+            return crate::content::apply_pack(
+                root,
+                target,
+                instance,
+                temp.path(),
+                &state,
+                merge,
+                cancel,
+            );
+        }
+        if self.job.is_some() {
+            fs::write(temp.path().join("pack-task-id"), &instance.id)?;
         }
         fs::write(
             temp.path().join("instance.json"),

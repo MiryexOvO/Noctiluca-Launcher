@@ -1,3 +1,4 @@
+pub(crate) mod review;
 use crate::{
     backups,
     library::{self, Instance, Loader},
@@ -5,6 +6,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use mc_launcher_core::io::hash::sha1_file;
+use review::{Choices, Review};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -78,7 +80,7 @@ pub struct PackState {
     pub title: String,
     #[serde(default)]
     pub archive_sha1: Option<String>,
-    files: BTreeMap<String, String>,
+    pub(crate) files: BTreeMap<String, String>,
 }
 fn visit(
     dir: &Path,
@@ -170,12 +172,19 @@ pub fn recover(root: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) struct Merge<'a> {
+    pub review: Option<&'a Review>,
+    pub choices: &'a Choices,
+    pub task: Option<&'a str>,
+}
+
 pub fn apply_pack(
     root: &Path,
     item: &Instance,
     new: &Instance,
     source: &Path,
     state: &PackState,
+    merge: Merge<'_>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Instance> {
     use std::sync::atomic::Ordering;
@@ -202,13 +211,33 @@ pub fn apply_pack(
     }
     let target = tmp.path().join("game");
     fs::create_dir_all(&target)?;
+    let fresh = Review::build(&target, old.as_ref(), &state.files)?;
+    ensure!(
+        merge.review.is_none_or(|seen| seen == &fresh)
+            && merge
+                .choices
+                .iter()
+                .all(|(p, c)| fresh.conflicts.get(p) == Some(c)),
+        "本地配置或整合包已经变化，请重新检查更新清单"
+    );
+    let marker = tmp.path().join("pack-task-id");
+    if let Some(id) = merge.task {
+        fs::write(marker, id)?;
+    } else if marker.try_exists()? {
+        fs::remove_file(marker)?;
+    }
+    let incoming = review::indexed(&state.files);
+    let previous = old
+        .as_ref()
+        .map(|s| review::indexed(&s.files))
+        .unwrap_or_default();
     if let Some(prev) = &old {
         for (rel, hash) in &prev.files {
             let p = target.join(packs::relative(rel)?);
-            if !state.files.contains_key(rel)
+            if !incoming.contains_key(&rel.to_lowercase())
                 && !protected(rel)
                 && p.is_file()
-                && sha1_file(&p)? == *hash
+                && (merge.choices.contains_key(rel) || sha1_file(&p)? == *hash)
             {
                 fs::remove_file(p)?;
             }
@@ -223,12 +252,17 @@ pub fn apply_pack(
             continue;
         }
         ensure!(sha1_file(&source)? == *hash, "更新来源文件校验失败：{rel}");
+        if fresh.conflicts.contains_key(rel) && !merge.choices.contains_key(rel) {
+            continue;
+        }
         if p.is_file() {
             let actual = sha1_file(&p)?;
             if actual == *hash || protected(rel) {
                 continue;
             }
-            if old.as_ref().and_then(|v| v.files.get(rel)) != Some(&actual) {
+            if !merge.choices.contains_key(rel)
+                && previous.get(&rel.to_lowercase()).map(|(_, hash)| *hash) != Some(&actual)
+            {
                 if rel.starts_with("config/") || rel.starts_with("defaultconfigs/") {
                     continue;
                 }
@@ -266,6 +300,13 @@ pub fn apply_pack(
     ensure!(!cancel.load(Ordering::Relaxed), "已取消更新");
     let _library = crate::game::lock_file(&root.join("library.lock"), "实例库正在使用")?;
     recover(root)?;
+    if let Some(seen) = merge.review {
+        let current_state = PackState::read(&live)?;
+        ensure!(
+            Review::build(&live.join("game"), current_state.as_ref(), &state.files)? == *seen,
+            "更新期间本地配置已更改，已保留原实例，请重新检查更新清单"
+        );
+    }
     drop(lock);
     let latest: Instance = serde_json::from_slice(&fs::read(live.join("instance.json"))?)?;
     updated = Instance {
@@ -311,7 +352,19 @@ pub fn rollback(root: &Path, item: &Instance, backup: &Path) -> Result<Instance>
             *hash = sha1_file(&p)?;
         }
     }
-    apply_pack(root, item, &before, backup, &state, &false.into())
+    apply_pack(
+        root,
+        item,
+        &before,
+        backup,
+        &state,
+        Merge {
+            review: None,
+            choices: &Choices::new(),
+            task: None,
+        },
+        &false.into(),
+    )
 }
 pub fn pinned_version(root: &Path, item: &Instance) -> Result<String> {
     if let Some(v) = &item.loader_version {

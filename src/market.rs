@@ -86,7 +86,7 @@ pub struct Hit {
     pub reference_version: Option<String>,
     pub reference_size: Option<u64>,
 }
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, Deserialize)]
 pub struct Release {
     pub source: Source,
     pub project: String,
@@ -96,6 +96,7 @@ pub struct Release {
     pub sha1: String,
     pub filename: String,
     pub size: Option<u64>,
+    #[serde(skip)]
     pub metadata: status::Metadata,
 }
 impl Release {

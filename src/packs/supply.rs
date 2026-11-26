@@ -34,7 +34,7 @@ impl Preview {
     pub fn supply(&self, index: usize, source: &Path, cancel: &AtomicBool) -> Result<()> {
         let file = self.files.get(index).context("清单文件不存在")?;
         let input = File::open(source).context("无法读取所选文件")?;
-        let mut copy = tempfile::NamedTempFile::new_in(self.cache.path())?;
+        let mut copy = tempfile::NamedTempFile::new_in(&self.cache)?;
         let hash = hash_copy(input, &mut copy, cancel)?;
         ensure!(
             hash.eq_ignore_ascii_case(&file.hashes["sha1"]),
