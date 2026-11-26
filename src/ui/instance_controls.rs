@@ -92,11 +92,14 @@ impl Home {
                     })),
             );
         }
-        let mut card = panel(if editing {
-            "全局游戏内存"
-        } else {
-            "游戏内存"
-        })
+        let mut card = panel(
+            cx,
+            if editing {
+                "全局游戏内存"
+            } else {
+                "游戏内存"
+            },
+        )
         .child(
             div()
                 .flex()
@@ -180,12 +183,12 @@ impl Home {
                 .rounded_full()
                 .overflow_hidden()
                 .flex()
-                .bg(rgb(LINE))
+                .bg(cx.theme().colors.border)
                 .child(
                     div()
                         .h_full()
                         .w(relative(used as f32 / total as f32))
-                        .bg(rgb(0x9593b8)),
+                        .bg(cx.theme().colors.fg_subtle),
                 )
                 .child(
                     div()
@@ -193,7 +196,7 @@ impl Home {
                         .w(relative(
                             u64::from(max).min(r.available) as f32 / total as f32,
                         ))
-                        .bg(rgb(ACCENT)),
+                        .bg(cx.theme().colors.accent),
                 );
             card = card.child(rail).child(
                 div()
@@ -201,16 +204,18 @@ impl Home {
                     .flex_wrap()
                     .justify_between()
                     .gap_1()
-                    .child(kicker(&format!(
-                        "系统已用 {:.1} / {:.1} GiB",
-                        gib(used),
-                        gib(total)
-                    )))
-                    .child(kicker(&format!(
-                        "游戏 {:.1} GiB · 当前可用 {:.1} GiB",
-                        gib(max.into()),
-                        gib(r.available)
-                    ))),
+                    .child(kicker(
+                        cx,
+                        &format!("系统已用 {:.1} / {:.1} GiB", gib(used), gib(total)),
+                    ))
+                    .child(kicker(
+                        cx,
+                        &format!(
+                            "游戏 {:.1} GiB · 当前可用 {:.1} GiB",
+                            gib(max.into()),
+                            gib(r.available)
+                        ),
+                    )),
             );
         }
         card
@@ -219,15 +224,21 @@ impl Home {
         let linked = self.instances[self.selected].external.is_some();
         let id = self.instances[self.selected].id.clone();
         if self.controls.confirm.as_ref() == Some(&id) {
-            return panel(&format!(
-                "将「{}」移入已删除实例？",
-                self.instances[self.selected].name
+            return panel(
+                cx,
+                &format!(
+                    "将「{}」移入已删除实例？",
+                    self.instances[self.selected].name
+                ),
+            )
+            .child(kicker(
+                cx,
+                if linked {
+                    "移除启动器中的关联，原目录保留。"
+                } else {
+                    "存档和模组会一起保留，可在实例管理中恢复。"
+                },
             ))
-            .child(kicker(if linked {
-                "移除启动器中的关联，原目录保留。"
-            } else {
-                "存档和模组会一起保留，可在实例管理中恢复。"
-            }))
             .child(
                 div()
                     .flex()
@@ -250,7 +261,7 @@ impl Home {
         div()
             .flex()
             .border_t_1()
-            .border_color(rgb(LINE))
+            .border_color(cx.theme().colors.border)
             .pt_1()
             .child(
                 Button::new(
@@ -320,7 +331,7 @@ impl Home {
         );
         if let Some(items) = &self.controls.removed {
             if items.is_empty() {
-                row = row.child(kicker("没有已删除的实例"));
+                row = row.child(kicker(cx, "没有已删除的实例"));
             }
             for (i, p) in items.iter().enumerate() {
                 let id = p.id.clone();

@@ -20,7 +20,7 @@ mod preferences;
 mod third_party;
 mod ui;
 
-use ely_gpui_component::Assets;
+use ely_gpui_component::{Assets, theme::ActiveTheme};
 use gpui::{prelude::*, *};
 
 pub const APP_NAME: &str = "Noctiluca";
@@ -55,7 +55,7 @@ fn main() {
                     root,
                 ))
             });
-            ui::apply_palette(cx);
+            ui::apply_palette(cx, false);
             match library {
                 Ok((items, accounts, root)) => {
                     cx.open_window(options, |window, cx| {
@@ -87,8 +87,8 @@ impl Render for StartupError {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(ui::BG))
-            .text_color(rgb(ui::INK))
+            .bg(ui::window_background(cx))
+            .text_color(cx.theme().colors.fg)
             .child(ui::title_bar(window, cx, |window, _| {
                 window.remove_window()
             }))

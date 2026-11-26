@@ -131,15 +131,18 @@ fn file_size(size: Option<u64>, label: &str) -> String {
     format!("{label} · {}", format_bytes(bytes))
 }
 
-fn reference_size(hit: &Hit, kind: Kind) -> Div {
-    kicker(&file_size(
-        hit.reference_size,
-        if kind == Kind::Pack {
-            "参考压缩包"
-        } else {
-            "参考文件"
-        },
-    ))
+fn reference_size(cx: &App, hit: &Hit, kind: Kind) -> Div {
+    kicker(
+        cx,
+        &file_size(
+            hit.reference_size,
+            if kind == Kind::Pack {
+                "参考压缩包"
+            } else {
+                "参考文件"
+            },
+        ),
+    )
 }
 
 impl Home {
@@ -446,13 +449,13 @@ impl Home {
                     .justify_between()
                     .items_center()
                     .gap_3()
-                    .child(super::project_icon::tile(&self.root, hit, h.kind, 64.))
+                    .child(super::project_icon::tile(cx, &self.root, hit, h.kind, 64.))
                     .child(
                         div()
                             .min_w_0()
                             .flex_1()
                             .child(heading(&hit.title))
-                            .child(reference_size(hit, h.kind)),
+                            .child(reference_size(cx, hit, h.kind)),
                     )
                     .child(
                         Button::new("discover-back", "返回搜索结果").on_click(cx.listener(
@@ -463,7 +466,7 @@ impl Home {
                         )),
                     ),
             )
-            .child(kicker(&hit.description));
+            .child(kicker(cx, &hit.description));
         if !h.is_pack() {
             let status = if let Some(e) = &h.check_error {
                 format!("安装状态暂不可用 · {e}")
@@ -477,7 +480,7 @@ impl Home {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().child(kicker(&status)))
+                    .child(div().flex_1().child(kicker(cx, &status)))
                     .child(
                         Button::new("check-installed", "重新检查安装状态")
                             .disabled(h.checking || busy)
@@ -488,17 +491,19 @@ impl Home {
             );
         }
         if !h.is_pack() && h.target.is_none() {
-            let mut targets = panel("选择安装到哪个实例");
+            let mut targets = panel(cx, "选择安装到哪个实例");
             if self.instances.is_empty() {
-                targets = targets.child(kicker("实例库为空，请先创建实例。")).child(
-                    Button::new("first-instance", "新建实例").on_click(cx.listener(
-                        |home, _, _, cx| {
-                            home.page = Page::Create;
-                            home.fetch_versions(false, cx);
-                            cx.notify();
-                        },
-                    )),
-                );
+                targets = targets
+                    .child(kicker(cx, "实例库为空，请先创建实例。"))
+                    .child(
+                        Button::new("first-instance", "新建实例").on_click(cx.listener(
+                            |home, _, _, cx| {
+                                home.page = Page::Create;
+                                home.fetch_versions(false, cx);
+                                cx.notify();
+                            },
+                        )),
+                    );
             }
             for (i, item) in self.instances.iter().enumerate() {
                 let id = item.id.clone();
@@ -528,13 +533,12 @@ impl Home {
                                 .flex()
                                 .flex_col()
                                 .child(item.name.clone())
-                                .child(kicker(&label)),
+                                .child(kicker(cx, &label)),
                         )
-                        .child(kicker(&format!(
-                            "{} · {}",
-                            item.version,
-                            item.loader.label()
-                        )))
+                        .child(kicker(
+                            cx,
+                            &format!("{} · {}", item.version, item.loader.label()),
+                        ))
                         .child(
                             Button::new(
                                 ("target", i),
@@ -587,23 +591,26 @@ impl Home {
                     ),
             );
         }
-        let mut files = panel(if h.is_pack() {
-            "整合包版本"
-        } else {
-            "兼容版本"
-        });
+        let mut files = panel(
+            cx,
+            if h.is_pack() {
+                "整合包版本"
+            } else {
+                "兼容版本"
+            },
+        );
         if h.loading {
-            return body.child(files.child(kicker("正在查询发布文件…")));
+            return body.child(files.child(kicker(cx, "正在查询发布文件…")));
         }
         if let Some(error) = &h.error {
-            return body.child(files.child(kicker(error)).child(
+            return body.child(files.child(kicker(cx, error)).child(
                 Button::new("retry-files", "重新查询").on_click(
                     cx.listener(|home, _, _, cx| home.discover_files(home.hub.target.clone(), cx)),
                 ),
             ));
         }
         if h.releases.is_empty() {
-            return body.child(files.child(kicker("没有符合游戏版本和加载器条件的发布文件")));
+            return body.child(files.child(kicker(cx, "没有符合游戏版本和加载器条件的发布文件")));
         }
         let installed = h
             .target
@@ -612,10 +619,10 @@ impl Home {
             .and_then(Option::as_ref);
         let found = installed.map_or(&[][..], |s| s.files.as_slice());
         if let Some(s) = installed {
-            files = files.child(kicker(&s.label()));
+            files = files.child(kicker(cx, &s.label()));
         }
         if h.kind == Kind::Mod && found.len() > 1 {
-            files = files.child(kicker("此实例已有多个同项目模组，请先在实例中整理。"));
+            files = files.child(kicker(cx, "此实例已有多个同项目模组，请先在实例中整理。"));
         }
         if let Some(target) = &h.target
             && !h.sharing.is_empty()
@@ -626,14 +633,19 @@ impl Home {
                 .map(|name| format!("「{name}」"))
                 .collect::<Vec<_>>()
                 .join("、");
-            files = files.child(div().rounded_md().bg(rgb(SELECTED)).p_3().text_sm().child(
-                format!(
-                    "「{}」与{}共用{}目录。安装或替换会同时更改这些实例使用的文件。",
-                    target.name,
-                    names,
-                    h.kind.label()
-                ),
-            ));
+            files = files.child(
+                div()
+                    .rounded_md()
+                    .bg(cx.theme().colors.active)
+                    .p_3()
+                    .text_sm()
+                    .child(format!(
+                        "「{}」与{}共用{}目录。安装或替换会同时更改这些实例使用的文件。",
+                        target.name,
+                        names,
+                        h.kind.label()
+                    )),
+            );
         }
         for (i, file) in h.releases.iter().enumerate().skip(h.page * 10).take(10) {
             let file = file.clone();
@@ -647,10 +659,10 @@ impl Home {
                     .items_center()
                     .gap_2()
                     .child(div().flex_1().min_w_0().child(file.name.clone()))
-                    .child(kicker(&file_size(
-                        file.size,
-                        if h.is_pack() { "压缩包" } else { "文件" },
-                    )))
+                    .child(kicker(
+                        cx,
+                        &file_size(file.size, if h.is_pack() { "压缩包" } else { "文件" }),
+                    ))
                     .child(
                         Button::new(
                             ("discovery-install", i),
@@ -685,11 +697,10 @@ impl Home {
                                 cx.notify();
                             })),
                     )
-                    .child(kicker(&format!(
-                        "{} / {}",
-                        h.page + 1,
-                        h.releases.len().div_ceil(10)
-                    )))
+                    .child(kicker(
+                        cx,
+                        &format!("{} / {}", h.page + 1, h.releases.len().div_ceil(10)),
+                    ))
                     .child(
                         Button::new("files-next", "下一页")
                             .disabled((h.page + 1) * 10 >= h.releases.len())
@@ -736,7 +747,7 @@ impl Home {
                     })),
             );
         }
-        let mut filters = panel("搜索与筛选")
+        let mut filters = panel(cx, "搜索与筛选")
             .child(
                 div()
                     .flex()
@@ -794,27 +805,27 @@ impl Home {
             .child(tabs)
             .child(filters);
         if h.loading {
-            return body.child(kicker("正在搜索…"));
+            return body.child(kicker(cx, "正在搜索…"));
         }
         if let Some(error) = &h.error {
-            return body.child(kicker(error));
+            return body.child(kicker(cx, error));
         }
         if h.hits.is_empty() && h.searched {
-            body = body.child(kicker("没有匹配的项目"));
+            body = body.child(kicker(cx, "没有匹配的项目"));
         }
         for (i, hit) in h.hits.iter().enumerate() {
             let hit = hit.clone();
             body = body.child(
                 div()
                     .p_3()
-                    .bg(rgb(PANEL))
+                    .bg(cx.theme().colors.surface)
                     .rounded_lg()
                     .border_1()
-                    .border_color(rgb(LINE))
+                    .border_color(cx.theme().colors.border)
                     .flex()
                     .items_center()
                     .gap_3()
-                    .child(super::project_icon::tile(&self.root, &hit, h.kind, 48.))
+                    .child(super::project_icon::tile(cx, &self.root, &hit, h.kind, 48.))
                     .child(
                         div()
                             .flex_1()
@@ -827,8 +838,8 @@ impl Home {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(hit.title.clone()),
                             )
-                            .child(kicker(&hit.description))
-                            .child(reference_size(&hit, h.kind)),
+                            .child(kicker(cx, &hit.description))
+                            .child(reference_size(cx, &hit, h.kind)),
                     )
                     .child(
                         Button::new(

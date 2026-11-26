@@ -225,7 +225,7 @@ impl Home {
         } else {
             5
         };
-        let mut games = panel("游戏版本").child(Input::new(&self.query)).child(
+        let mut games = panel(cx, "游戏版本").child(Input::new(&self.query)).child(
             div()
                 .flex()
                 .gap_2()
@@ -259,11 +259,14 @@ impl Home {
                 ),
         );
         games = if values.is_empty() {
-            games.child(kicker(if self.fetching {
-                "正在获取官方版本…"
-            } else {
-                "没有匹配的游戏版本"
-            }))
+            games.child(kicker(
+                cx,
+                if self.fetching {
+                    "正在获取官方版本…"
+                } else {
+                    "没有匹配的游戏版本"
+                },
+            ))
         } else {
             games.child(self.version_row(&values, page_size, false, cx))
         };
@@ -292,16 +295,16 @@ impl Home {
                     })),
             );
         }
-        let mut components = panel("加载器").child(loaders);
+        let mut components = panel(cx, "加载器").child(loaders);
         if w.loader() != Loader::Vanilla {
-            components = components.child(kicker("加载器版本"));
+            components = components.child(kicker(cx, "加载器版本"));
             if w.builds.is_empty() {
                 let message = w.error.as_deref().unwrap_or(if w.loading {
                     "正在查询兼容构建…"
                 } else {
                     "该游戏版本没有可用构建"
                 });
-                components = components.child(kicker(message));
+                components = components.child(kicker(cx, message));
                 if w.error.is_some() {
                     components = components.child(
                         Button::new("retry-builds", "重新查询")
@@ -340,7 +343,7 @@ impl Home {
                         .on_click(cx.listener(|home, _, _, cx| home.import_pack(cx))),
                     ),
             )
-            .child(kicker("实例名称"))
+            .child(kicker(cx, "实例名称"))
             .child(Input::new(&self.name))
             .child(games)
             .child(components)
@@ -364,7 +367,7 @@ impl Home {
                                 home.message(r, cx);
                             })),
                     )
-                    .child(kicker(&summary)),
+                    .child(kicker(cx, &summary)),
             )
     }
 }

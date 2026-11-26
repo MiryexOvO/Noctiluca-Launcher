@@ -1,3 +1,5 @@
+mod appearance;
+pub(crate) use appearance::{apply_palette, window_background};
 mod content;
 mod create;
 mod hub;
@@ -37,53 +39,6 @@ use crate::{
     library::{self, Instance, Loader},
     mods,
 };
-
-pub(crate) const BG: u32 = 0x323446;
-const PANEL: u32 = 0x3c3b4c;
-const SIDEBAR: u32 = 0x413745;
-const LINE: u32 = 0x565263;
-pub(crate) const INK: u32 = 0xf2edf5;
-const MUTED: u32 = 0xc9bfd0;
-const ACCENT: u32 = 0xd3b1e6;
-const SELECTED: u32 = 0x55475e;
-
-pub fn apply_palette(cx: &mut App) {
-    use ely_gpui_component::theme::{Mode, Palette, Theme};
-    let mut palette = Palette::dark(false);
-    for (token, color) in [
-        ("bg", BG),
-        ("surface", PANEL),
-        ("sunken", 0x302e3d),
-        ("overlay", 0x454052),
-        ("hover", 0x50495b),
-        ("active", SELECTED),
-        ("border", LINE),
-        ("border_strong", 0x786b82),
-        ("fg", INK),
-        ("fg_muted", MUTED),
-        ("fg_subtle", 0xb9adbf),
-        (
-            "accent",
-            match crate::preferences::current().accent {
-                1 => 0xb1c8eb,
-                2 => 0xe4b7cd,
-                _ => ACCENT,
-            },
-        ),
-        ("accent_hover", 0xe1c5f0),
-        ("on_accent", 0x302638),
-        ("focus", ACCENT),
-        ("selection", SELECTED),
-        ("success", ACCENT),
-        ("success_subtle", SELECTED),
-        ("link", 0xbac8ff),
-    ] {
-        *palette.token_mut(token) = rgb(color).into();
-    }
-    Theme::set_palette(Mode::Dark, Some(palette), cx);
-    Theme::set_mode_now(Mode::Dark, cx);
-    motion::sync_preference(cx);
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -507,6 +462,7 @@ impl Home {
 
     fn sidebar(&self, frame: motion::Frame, cx: &Context<Self>) -> impl IntoElement {
         let busy = self.cancel.is_some() || self.searching || self.logging_in || self.copying;
+        let accent = cx.theme().colors.accent;
         let mut list = div()
             .relative()
             .flex()
@@ -523,8 +479,8 @@ impl Home {
                         .rounded_md()
                         .bg(linear_gradient(
                             90.,
-                            linear_color_stop(rgb(SELECTED), 0.),
-                            linear_color_stop(rgb(0x4b4055), 1.),
+                            linear_color_stop(cx.theme().colors.active, 0.),
+                            linear_color_stop(cx.theme().colors.hover, 1.),
                         ))
                         .child(
                             div()
@@ -534,7 +490,7 @@ impl Home {
                                 .w(px(3.))
                                 .h(px(26.))
                                 .rounded_full()
-                                .bg(rgb(ACCENT)),
+                                .bg(cx.theme().colors.accent),
                         ),
                 )
             });
@@ -551,13 +507,13 @@ impl Home {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .when(!selected, |el| el.hover(|s| s.bg(rgba(0xd3b1e617))))
+                    .when(!selected, |el| el.hover(|s| s.bg(accent.opacity(0.09))))
                     .cursor_pointer()
-                    .child(Icon::new(IconName::Box).color(rgb(if selected {
-                        ACCENT
+                    .child(Icon::new(IconName::Box).color(if selected {
+                        accent
                     } else {
-                        MUTED
-                    })))
+                        cx.theme().colors.fg_muted
+                    }))
                     .child(
                         div()
                             .flex_1()
@@ -565,16 +521,21 @@ impl Home {
                             .flex()
                             .flex_col()
                             .child(div().truncate().child(item.name.clone()))
-                            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                                "{} · {}{}",
-                                item.version,
-                                item.loader.label(),
-                                if self.running.contains_key(&item.id) {
-                                    " · 运行中"
-                                } else {
-                                    ""
-                                }
-                            ))),
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().colors.fg_muted)
+                                    .child(format!(
+                                        "{} · {}{}",
+                                        item.version,
+                                        item.loader.label(),
+                                        if self.running.contains_key(&item.id) {
+                                            " · 运行中"
+                                        } else {
+                                            ""
+                                        }
+                                    )),
+                            ),
                     )
                     .on_click(cx.listener(move |home, _, _, cx| {
                         if !busy {
@@ -591,9 +552,13 @@ impl Home {
             .flex()
             .flex_col()
             .gap_2()
-            .bg(rgb(SIDEBAR))
+            .bg(linear_gradient(
+                165.,
+                linear_color_stop(cx.theme().colors.overlay, 0.),
+                linear_color_stop(cx.theme().colors.sunken, 1.),
+            ))
             .border_r_1()
-            .border_color(rgb(LINE))
+            .border_color(cx.theme().colors.border)
             .child(
                 div()
                     .flex()
@@ -603,7 +568,7 @@ impl Home {
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(MUTED))
+                            .text_color(cx.theme().colors.fg_muted)
                             .child(format!("实例库  /  {}", self.instances.len())),
                     )
                     .child(
@@ -668,7 +633,7 @@ impl Home {
                 div()
                     .flex_none()
                     .border_t_1()
-                    .border_color(rgb(LINE))
+                    .border_color(cx.theme().colors.border)
                     .pt_2()
                     .child(self.account_card(busy, cx)),
             )
@@ -723,23 +688,34 @@ impl Home {
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .child(kicker(&format!(
-                            "Minecraft Java 版  /  {}",
-                            self.accounts
-                                .current()
-                                .map(|p| p.name.as_str())
-                                .unwrap_or("未选择账号")
-                        )))
+                        .child(kicker(
+                            cx,
+                            &format!(
+                                "Minecraft Java 版  /  {}",
+                                self.accounts
+                                    .current()
+                                    .map(|p| p.name.as_str())
+                                    .unwrap_or("未选择账号")
+                            ),
+                        ))
                         .child(heading(&item.name))
-                        .child(div().text_sm().text_color(rgb(MUTED)).child(format!(
-                            "游戏版本 {}     /     {}     /     {}",
-                            item.version,
-                            format_args!(
-                                "{} {}",
-                                item.loader.label(),
-                                item.loader_version.as_deref().unwrap_or("")
-                            ), item.external.as_ref().map_or("独立游戏目录", |_| "原目录启动")
-                        ))),
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().colors.fg_muted)
+                                .child(format!(
+                                    "游戏版本 {}     /     {}     /     {}",
+                                    item.version,
+                                    format_args!(
+                                        "{} {}",
+                                        item.loader.label(),
+                                        item.loader_version.as_deref().unwrap_or("")
+                                    ),
+                                    item.external
+                                        .as_ref()
+                                        .map_or("独立游戏目录", |_| "原目录启动")
+                                )),
+                        ),
                     0,
                 ),
             )
@@ -808,7 +784,7 @@ impl Home {
             .flex()
             .flex_col()
             .gap_3()
-            .child(kicker(&self.instances[self.selected].name))
+            .child(kicker(cx, &self.instances[self.selected].name))
             .child(heading("实时控制台"))
             .child(tabs)
             .child(
@@ -848,7 +824,7 @@ impl Home {
                 div()
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(PANEL))
+                    .bg(cx.theme().colors.surface)
                     .text_sm()
                     .font_family("Consolas")
                     .child(self.console_text.clone()),
@@ -905,7 +881,7 @@ impl Home {
             .flex()
             .flex_col()
             .gap_4()
-            .child(kicker(&self.instances[self.selected].name))
+            .child(kicker(cx, &self.instances[self.selected].name))
             .child(heading("备份与克隆"))
             .child(
                 div()
@@ -927,7 +903,7 @@ impl Home {
                             ),
                     ),
             )
-            .child(kicker(&format!("本地备份  /  {}", self.backups.len())));
+            .child(kicker(cx, &format!("本地备份  /  {}", self.backups.len())));
         for (idx, backup) in self.backups.iter().enumerate() {
             let time: chrono::DateTime<chrono::Local> = backup.created.into();
             let path = backup.path.clone();
@@ -1108,7 +1084,7 @@ impl Home {
             .flex()
             .flex_col()
             .gap_3()
-            .child(kicker(&item.name))
+            .child(kicker(cx, &item.name))
             .child(heading("模组管理"))
             .child(
                 div()
@@ -1183,7 +1159,7 @@ impl Home {
                     .on_click(cx.listener(move |h, _, _, cx| h.apply_mod_update(u.clone(), cx))),
             );
         }
-        page = page.child(kicker(&format!("已安装  /  {}", self.jars.len())));
+        page = page.child(kicker(cx, &format!("已安装  /  {}", self.jars.len())));
         for (idx, name) in self.jars.iter().enumerate() {
             let name = name.clone();
             let disabled = name.ends_with(".disabled");
@@ -1269,10 +1245,10 @@ fn format_bytes(bytes: u64) -> String {
     format!("{:.1} {unit}", bytes as f64 / scale as f64)
 }
 
-fn kicker(text: &str) -> Div {
+fn kicker(cx: &App, text: &str) -> Div {
     div()
         .text_sm()
-        .text_color(rgb(MUTED))
+        .text_color(cx.theme().colors.fg_muted)
         .child(text.to_owned())
 }
 fn heading(text: &str) -> Div {
@@ -1281,17 +1257,17 @@ fn heading(text: &str) -> Div {
         .font_weight(FontWeight::SEMIBOLD)
         .child(text.to_owned())
 }
-fn panel(title: &str) -> Div {
+fn panel(cx: &App, title: &str) -> Div {
     div()
         .p_4()
         .rounded_lg()
         .border_1()
-        .border_color(rgb(LINE))
-        .bg(rgb(PANEL))
+        .border_color(cx.theme().colors.border)
+        .bg(cx.theme().colors.surface)
         .flex()
         .flex_col()
         .gap_3()
-        .child(kicker(title))
+        .child(kicker(cx, title))
 }
 
 impl Drop for Home {
@@ -1345,12 +1321,8 @@ impl Render for Home {
             .size_full()
             .flex()
             .flex_col()
-            .bg(linear_gradient(
-                104.,
-                linear_color_stop(rgb(0x433944), 0.),
-                linear_color_stop(rgb(BG), 1.),
-            ))
-            .text_color(rgb(INK))
+            .bg(window_background(cx))
+            .text_color(cx.theme().colors.fg)
             .font_family("Microsoft YaHei UI")
             .child(title_bar(window, cx, move |window, cx| {
                 if view.update(cx, Self::can_close).unwrap_or(true) {
@@ -1363,8 +1335,8 @@ impl Render for Home {
                     .on_drop(cx.listener(|home, paths: &ExternalPaths, _, cx| {
                         home.drop_pack(paths.paths(), cx)
                     }))
-                    .drag_over::<ExternalPaths>(|style, _, _, _| {
-                        style.border_1().border_color(rgb(ACCENT))
+                    .drag_over::<ExternalPaths>(|style, _, _, cx| {
+                        style.border_1().border_color(cx.theme().colors.accent)
                     })
                     .flex()
                     .flex_1()
@@ -1397,11 +1369,15 @@ impl Render for Home {
                                     .flex_col()
                                     .gap_2()
                                     .border_t_1()
-                                    .border_color(rgb(LINE))
+                                    .border_color(cx.theme().colors.border)
                                     .px_6()
                                     .py_3()
                                     .text_sm()
-                                    .text_color(rgb(if self.failed { 0xffb5c5 } else { ACCENT }))
+                                    .text_color(if self.failed {
+                                        rgb(0xffb5c5).into()
+                                    } else {
+                                        cx.theme().colors.accent
+                                    })
                                     .when(
                                         self.cancel.is_some()
                                             || self.copying

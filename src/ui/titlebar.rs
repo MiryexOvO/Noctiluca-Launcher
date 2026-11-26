@@ -1,4 +1,3 @@
-use super::{ACCENT, BG, INK, LINE, SIDEBAR};
 use ely_gpui_component::{
     primitives::{Icon, IconName},
     shell::drag_region,
@@ -65,11 +64,11 @@ pub(crate) fn title_bar(
         .h(cx.theme().titlebar_height())
         .bg(linear_gradient(
             90.,
-            linear_color_stop(rgb(SIDEBAR), 0.),
-            linear_color_stop(rgb(BG), 1.),
+            linear_color_stop(cx.theme().colors.overlay, 0.),
+            linear_color_stop(cx.theme().colors.bg, 1.),
         ))
         .border_b_1()
-        .border_color(rgb(LINE))
+        .border_color(cx.theme().colors.border)
         .child(
             drag.flex_1()
                 .h_full()
@@ -77,12 +76,12 @@ pub(crate) fn title_bar(
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(Icon::new(IconName::Layers).color(rgb(ACCENT)))
+                .child(Icon::new(IconName::Layers).color(cx.theme().colors.accent))
                 .child(
                     div()
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(INK))
+                        .text_color(cx.theme().colors.fg)
                         .child(crate::APP_NAME),
                 ),
         )

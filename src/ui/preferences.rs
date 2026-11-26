@@ -33,12 +33,17 @@ impl Settings {
 impl Home {
     fn save_pref(&mut self, change: impl FnOnce(&mut Prefs), cx: &mut Context<Self>) {
         let mut p = crate::preferences::current();
+        let old_source = p.community;
+        let old_accent = p.accent;
         change(&mut p);
         let source = p.community;
         let clip = p.clipboard;
-        let old_source = crate::preferences::current().community;
+        let accent_changed = old_accent != p.accent;
         match p.save(&self.root) {
             Ok(()) => {
+                if accent_changed {
+                    super::apply_palette(cx, true);
+                }
                 if source != old_source {
                     self.hub.source = if source == 1 {
                         crate::market::Source::CurseForge
@@ -81,7 +86,7 @@ impl Home {
             .flex()
             .flex_col()
             .gap_1()
-            .child(kicker(title))
+            .child(kicker(cx, title))
             .child(row)
     }
     fn switch(
@@ -110,7 +115,7 @@ impl Home {
             .flex()
             .flex_col()
             .gap_1()
-            .child(kicker(&format!("{label} · {value}")))
+            .child(kicker(cx, &format!("{label} · {value}")))
             .child(
                 Slider::new(id, f64::from(value))
                     .range(range.0.into(), range.1.into())
@@ -191,7 +196,7 @@ impl Home {
             .child(tabs);
         match self.prefs.tab {
             0 => page.child(
-                panel("启动选项")
+                panel(cx, "启动选项")
                     .child(self.choices(
                         "isolation",
                         "已有游戏目录的实例隔离",
@@ -252,11 +257,11 @@ impl Home {
                         |p, v| p.ip = v,
                         cx,
                     ))
-                    .child(kicker("Microsoft 正版验证 · 设备代码流")),
+                    .child(kicker(cx, "Microsoft 正版验证 · 设备代码流")),
             ),
             1 => {
                 let g = crate::memory::Global::read(&self.root).unwrap_or_default();
-                let mut memory = panel("全局游戏内存").child(
+                let mut memory = panel(cx, "全局游戏内存").child(
                     div().flex().gap_2().children(
                         [(true, "自动配置"), (false, "自定义")]
                             .into_iter()
@@ -281,32 +286,35 @@ impl Home {
                 .enumerate()
                 {
                     let view = cx.weak_entity();
-                    memory = memory.child(kicker(&format!("{label} · {v} MiB"))).child(
-                        Slider::new(("global-heap", i), v as f64)
-                            .range(min as f64, max as f64)
-                            .step(128.)
-                            .disabled(g.automatic)
-                            .on_change(move |v, _, cx| {
-                                let _ = view.update(cx, |h, cx| {
-                                    let mut g = h.controls.global;
-                                    if i == 0 {
-                                        g.max = v as u32;
-                                        g.initial = g.initial.min(g.max);
-                                    } else {
-                                        g.initial = v as u32;
-                                    }
-                                    let r = g.save(&h.root);
-                                    if r.is_ok() {
-                                        h.controls.global = g;
-                                    }
-                                    h.message(r, cx);
-                                });
-                            }),
-                    );
+                    memory = memory
+                        .child(kicker(cx, &format!("{label} · {v} MiB")))
+                        .child(
+                            Slider::new(("global-heap", i), v as f64)
+                                .range(min as f64, max as f64)
+                                .step(128.)
+                                .disabled(g.automatic)
+                                .on_change(move |v, _, cx| {
+                                    let _ = view.update(cx, |h, cx| {
+                                        let mut g = h.controls.global;
+                                        if i == 0 {
+                                            g.max = v as u32;
+                                            g.initial = g.initial.min(g.max);
+                                        } else {
+                                            g.initial = v as u32;
+                                        }
+                                        let r = g.save(&h.root);
+                                        if r.is_ok() {
+                                            h.controls.global = g;
+                                        }
+                                        h.message(r, cx);
+                                    });
+                                }),
+                        );
                 }
                 page.child(
-                    panel("Java 运行时")
+                    panel(cx, "Java 运行时")
                         .child(kicker(
+                            cx,
                             &p.java
                                 .as_ref()
                                 .map(|v| v.display().to_string())
@@ -328,7 +336,7 @@ impl Home {
                 .child(memory)
             }
             2 => page.child(
-                panel("游戏资源获取")
+                panel(cx, "游戏资源获取")
                     .child(self.choices(
                         "file-source",
                         "文件下载源",
@@ -377,10 +385,10 @@ impl Home {
                         |p, v| p.limit = v,
                         cx,
                     ))
-                    .child(kicker(&format!(
-                        "默认实例目录 · {}",
-                        self.root.join("instances").display()
-                    )))
+                    .child(kicker(
+                        cx,
+                        &format!("默认实例目录 · {}", self.root.join("instances").display()),
+                    ))
                     .child(self.switch(
                         "select-new",
                         "安装后选中新实例",
@@ -398,7 +406,7 @@ impl Home {
             ),
             3 => page
                 .child(
-                    panel("社区资源")
+                    panel(cx, "社区资源")
                         .child(self.choices(
                             "community",
                             "首选内容平台",
@@ -447,7 +455,7 @@ impl Home {
                         )),
                 )
                 .child(
-                    panel("辅助功能")
+                    panel(cx, "辅助功能")
                         .child(self.switch(
                             "release-news",
                             "Minecraft 正式版更新提示",
@@ -486,23 +494,15 @@ impl Home {
                         )),
                 ),
             4 => page.child(
-                panel("外观与语言")
-                    .child(kicker("界面强调色"))
-                    .child(
-                        div().flex().gap_1().children(
-                            ["淡紫", "雾蓝", "灰粉"]
-                                .into_iter()
-                                .enumerate()
-                                .map(|(i, label)| {
-                                    Button::new(("accent", i), label)
-                                        .when(p.accent == i as u8, |b| b.primary())
-                                        .on_click(cx.listener(move |h, _, _, cx| {
-                                            h.save_pref(|p| p.accent = i as u8, cx);
-                                            super::apply_palette(cx);
-                                        }))
-                                }),
-                        ),
-                    )
+                panel(cx, "外观与语言")
+                    .child(self.choices(
+                        "accent",
+                        "界面配色",
+                        &["淡紫", "雾蓝", "灰粉"],
+                        p.accent,
+                        |p, v| p.accent = v,
+                        cx,
+                    ))
                     .child(self.choices(
                         "ui-game-language",
                         "游戏语言",
@@ -521,8 +521,8 @@ impl Home {
             ),
             5 => {
                 page.child(
-                    panel("服务器直连")
-                        .child(kicker("游戏启动后自动加入指定服务器"))
+                    panel(cx, "服务器直连")
+                        .child(kicker(cx, "游戏启动后自动加入指定服务器"))
                         .child(Input::new(&self.prefs.server))
                         .child(
                             div()
@@ -551,15 +551,15 @@ impl Home {
                                         })),
                                 ),
                         )
-                        .child(kicker(&format!(
-                            "当前 · {}",
-                            if p.join_server { &p.server } else { "关闭" }
-                        ))),
+                        .child(kicker(
+                            cx,
+                            &format!("当前 · {}", if p.join_server { &p.server } else { "关闭" }),
+                        )),
                 )
             }
             _ => {
                 page.child(
-                    panel("软件信息")
+                    panel(cx, "软件信息")
                         .child(format!(
                             "Noctiluca {} · Rust / Ely GPUI",
                             env!("CARGO_PKG_VERSION")

@@ -148,7 +148,7 @@ impl Home {
             .flex()
             .flex_col()
             .gap_3()
-            .child(kicker(&self.instances[self.selected].name))
+            .child(kicker(cx, &self.instances[self.selected].name))
             .child(heading("启动设置"));
         for (label, field) in [
             ("Java 可执行文件", &self.fields.java),
@@ -159,7 +159,7 @@ impl Home {
                 &self.fields.cache,
             ),
         ] {
-            page = page.child(kicker(label)).child(Input::new(field));
+            page = page.child(kicker(cx, label)).child(Input::new(field));
         }
         page.child(
             div()

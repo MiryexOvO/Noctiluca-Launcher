@@ -23,13 +23,14 @@ pub(super) fn prepare(root: &Path, address: &str, cx: &mut App) {
     }
 }
 
-pub(super) fn tile(root: &Path, hit: &market::Hit, kind: Kind, size: f32) -> Div {
+pub(super) fn tile(cx: &App, root: &Path, hit: &market::Hit, kind: Kind, size: f32) -> Div {
     let icon = match kind {
         Kind::Mod => IconName::Puzzle,
         Kind::Pack => IconName::Package,
         Kind::Resource => IconName::Layers,
         Kind::Shader => IconName::Sun,
     };
+    let accent = cx.theme().colors.accent;
     let placeholder = move || {
         div()
             .size_full()
@@ -39,7 +40,7 @@ pub(super) fn tile(root: &Path, hit: &market::Hit, kind: Kind, size: f32) -> Div
             .child(
                 Icon::new(icon)
                     .size(ely_gpui_component::theme::IconSize::Lg)
-                    .color(rgb(ACCENT)),
+                    .color(accent),
             )
             .into_any_element()
     };
@@ -48,7 +49,7 @@ pub(super) fn tile(root: &Path, hit: &market::Hit, kind: Kind, size: f32) -> Div
         .flex_none()
         .rounded_md()
         .overflow_hidden()
-        .bg(rgb(SELECTED));
+        .bg(cx.theme().colors.active);
     let Some(url) = hit.icon_url.as_deref().filter(|u| !u.trim().is_empty()) else {
         return tile.child(placeholder());
     };

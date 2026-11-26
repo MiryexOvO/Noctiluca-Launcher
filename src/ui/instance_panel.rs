@@ -109,7 +109,7 @@ impl Home {
                 .child(
                     Icon::new(IconName::ChevronRight)
                         .size(IconSize::Xs)
-                        .color(rgb(MUTED)),
+                        .color(cx.theme().colors.fg_muted),
                 );
             tools = tools.child(if enabled {
                 row.tab_index(0)
@@ -129,13 +129,13 @@ impl Home {
             .gap_3()
             .when(!wide, |el| el.flex_col())
             .child(
-                panel("实例资源")
+                panel(cx, "实例资源")
                     .min_w_0()
                     .when(wide, |el| el.flex_1())
                     .child(tiles),
             )
             .child(
-                panel("实例工具")
+                panel(cx, "实例工具")
                     .min_w_0()
                     .when(wide, |el| el.w(px(218.)).flex_none())
                     .child(tools)

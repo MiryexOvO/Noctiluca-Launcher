@@ -411,7 +411,7 @@ impl Home {
             .flex_wrap()
             .gap_2()
             .border_t_1()
-            .border_color(rgb(LINE))
+            .border_color(cx.theme().colors.border)
             .px_6()
             .py_3();
         if let Some(draft) = &self.draft {
@@ -436,22 +436,25 @@ impl Home {
                                 .on_click(cx.listener(|h, _, _, cx| h.pick_pack(cx))),
                         ),
                 )
-                .child(kicker(&format!(
-                    "{}{source}  ·  Minecraft {}  ·  {loader}  ·  {} 个必需文件",
-                    pack.target
-                        .as_ref()
-                        .map(|t| format!("更新「{}」 · ", t.name))
-                        .unwrap_or_default(),
-                    item.version,
-                    pack.required_count
-                )));
+                .child(kicker(
+                    cx,
+                    &format!(
+                        "{}{source}  ·  Minecraft {}  ·  {loader}  ·  {} 个必需文件",
+                        pack.target
+                            .as_ref()
+                            .map(|t| format!("更新「{}」 · ", t.name))
+                            .unwrap_or_default(),
+                        item.version,
+                        pack.required_count
+                    ),
+                ));
             let estimate = pack.estimate(&draft.optional);
             let pending = match (estimate.unknown_count, estimate.pending_bytes) {
                 (0, bytes) => format_bytes(bytes),
                 (_, 0) => "待确认".to_owned(),
                 (_, bytes) => format!("至少 {}", format_bytes(bytes)),
             };
-            let mut transfer = panel("整合包依赖下载量").child(
+            let mut transfer = panel(cx, "整合包依赖下载量").child(
                 div()
                     .flex()
                     .flex_wrap()
@@ -467,14 +470,15 @@ impl Home {
                     )),
             );
             if estimate.unknown_count > 0 {
-                transfer = transfer.child(kicker(&format!(
-                    "{} 个待获取文件的大小未知",
-                    estimate.unknown_count
-                )));
+                transfer = transfer.child(kicker(
+                    cx,
+                    &format!("{} 个待获取文件的大小未知", estimate.unknown_count),
+                ));
             }
             if estimate.pending_count > 0 && pack.metadata_error.is_none() {
                 transfer = transfer
                     .child(kicker(
+                        cx,
                         "把已下载的文件拖到这里，或扫描整个文件夹（含子文件夹）。",
                     ))
                     .child(
@@ -499,10 +503,11 @@ impl Home {
                     );
             }
             body = body.child(transfer.child(kicker(
+                cx,
                 "按当前选中的清单文件统计。基础游戏、加载器和 Java 在安装时单独检查。",
             )));
             if let Some(error) = &pack.metadata_error {
-                body = body.child(panel("无法读取依赖文件信息").child(error.clone()));
+                body = body.child(panel(cx, "无法读取依赖文件信息").child(error.clone()));
                 let path = draft.path.clone();
                 let origin = pack.upstream.clone();
                 let target = pack.target.clone();
@@ -524,7 +529,7 @@ impl Home {
                 let (visible_missing, missing_pager) =
                     self.file_page(&missing, false, draft.missing_page, cx);
                 if !missing.is_empty() {
-                    let mut list = panel(&format!("还需补齐 {} 个文件", missing.len()));
+                    let mut list = panel(cx, &format!("还需补齐 {} 个文件", missing.len()));
                     for &i in visible_missing {
                         list = list.child(self.missing_file_row(
                             draft,
@@ -542,20 +547,22 @@ impl Home {
                     && !draft.supplied.contains(&i)
                 {
                     body = body.child(
-                        panel("下载失败，可重新安装或手动补齐")
+                        panel(cx, "下载失败，可重新安装或手动补齐")
                             .child(self.missing_file_row(draft, i, true, busy, cx)),
                     );
                 }
                 if let Some(error) = &pack.optional_error {
                     body = body.child(
-                        panel("可选文件信息暂不可用，可继续安装必需内容").child(error.clone()),
+                        panel(cx, "可选文件信息暂不可用，可继续安装必需内容").child(error.clone()),
                     );
                 } else if pack.optional_count > 0 {
                     body = body.child(self.optional_files(draft, busy, cx));
                 }
                 if !missing.is_empty() {
-                    footer =
-                        footer.child(kicker(&format!("还需手动补齐 {} 个文件", missing.len())));
+                    footer = footer.child(kicker(
+                        cx,
+                        &format!("还需手动补齐 {} 个文件", missing.len()),
+                    ));
                 } else {
                     footer = footer
                         .child(
@@ -588,6 +595,7 @@ impl Home {
         } else {
             body = body.child(heading("导入整合包")).when(!busy, |el| {
                 el.child(kicker(
+                    cx,
                     "将一个 .mrpack 或 .zip 文件拖入窗口，或从本机选择。",
                 ))
             });
@@ -649,7 +657,7 @@ impl Home {
         }));
         let mut options = div()
             .rounded_lg()
-            .bg(rgb(PANEL))
+            .bg(cx.theme().colors.surface)
             .px_3()
             .py_2()
             .flex()
@@ -692,7 +700,7 @@ impl Home {
                                 }),
                         )
                         .when(draft.supplied.contains(&i), |row| {
-                            row.child(kicker("已校验"))
+                            row.child(kicker(cx, "已校验"))
                         }),
                 );
             }
@@ -735,7 +743,7 @@ impl Home {
                             cx.listener(move |h, _, _, cx| change(h, page.saturating_sub(1), cx)),
                         ),
                 )
-                .child(kicker(&format!("{} / {pages}", page + 1)))
+                .child(kicker(cx, &format!("{} / {pages}", page + 1)))
                 .child(
                     Button::new(("pack-next", usize::from(optional)), "下一页")
                         .disabled(page + 1 >= pages)

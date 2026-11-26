@@ -159,7 +159,7 @@ impl Home {
             .flex_none()
             .rounded_md()
             .overflow_hidden()
-            .bg(rgb(SELECTED))
+            .bg(cx.theme().colors.active)
             .child(if let Some(path) = &self.profiles.avatar {
                 img(path.clone()).size_full().into_any_element()
             } else {
@@ -174,7 +174,7 @@ impl Home {
             .gap_2()
             .rounded_md()
             .p_2()
-            .bg(rgb(PANEL))
+            .bg(cx.theme().colors.surface)
             .child(avatar)
             .child(
                 div()
@@ -189,9 +189,14 @@ impl Home {
                             .truncate()
                             .child(p.name.clone()),
                     )
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(p.kind.label())),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().colors.fg_muted)
+                            .child(p.kind.label()),
+                    ),
             )
-            .child(Icon::new(IconName::ChevronUp).color(rgb(MUTED)));
+            .child(Icon::new(IconName::ChevronUp).color(cx.theme().colors.fg_muted));
         if busy {
             return row.opacity(0.65).cursor_not_allowed().into_any_element();
         }
@@ -199,7 +204,7 @@ impl Home {
             .tab_index(0)
             .focus_ring(cx)
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(SELECTED)));
+            .hover(|s| s.bg(cx.theme().colors.active));
         let view = cx.weak_entity();
         Popover::with_opener(
             "account-menu",
@@ -378,7 +383,7 @@ impl Home {
             )
             .detail("登录代码已自动复制。请在微软页面输入此代码，然后返回启动器。")
             .child(heading(&prompt.user_code))
-            .child(kicker("也可以在另一台设备上打开"))
+            .child(kicker(cx, "也可以在另一台设备上打开"))
             .child(div().text_sm().child(prompt.verification_uri.clone()))
             .action(move |_| {
                 Button::new("reopen-verification", "重新打开网页").on_click(move |_, _, cx| {
@@ -465,7 +470,7 @@ impl Home {
             && let Some(player) = self.accounts.current().cloned()
         {
             page = page.child(
-                panel("修改离线角色名")
+                panel(cx, "修改离线角色名")
                     .child(Input::new(&self.profiles.name))
                     .child(Button::new("save-name", "保存角色名").on_click(cx.listener(
                         move |h, _, _, cx| {
@@ -498,27 +503,30 @@ impl Home {
                         })),
                 );
             }
-            let mut form = panel("添加账号").child(choices);
+            let mut form = panel(cx, "添加账号").child(choices);
             match self.profiles.kind {
                 Kind::Microsoft => {
-                    form = form.child(kicker(if self.profiles.client.is_some() {
-                        "使用一次性代码在微软官方页面授权，也可以用手机完成。"
-                    } else {
-                        "微软登录配置读取失败。请查看下方的错误信息。"
-                    }));
+                    form = form.child(kicker(
+                        cx,
+                        if self.profiles.client.is_some() {
+                            "使用一次性代码在微软官方页面授权，也可以用手机完成。"
+                        } else {
+                            "微软登录配置读取失败。请查看下方的错误信息。"
+                        },
+                    ));
                 }
                 Kind::Offline => {
                     form = form
-                        .child(kicker("离线角色名"))
+                        .child(kicker(cx, "离线角色名"))
                         .child(Input::new(&self.profiles.name))
                 }
                 Kind::ThirdParty => {
                     form = form
-                        .child(kicker("Yggdrasil 认证服务"))
+                        .child(kicker(cx, "Yggdrasil 认证服务"))
                         .child(Input::new(&self.profiles.server))
                         .child(Input::new(&self.profiles.username))
                         .child(Input::new(&self.profiles.password))
-                        .child(kicker("角色名（多个角色时填写）"))
+                        .child(kicker(cx, "角色名（多个角色时填写）"))
                         .child(Input::new(&self.profiles.name))
                 }
             }
@@ -552,7 +560,7 @@ impl Home {
             let active = self.accounts.selected.as_ref() == Some(&key);
             let remove = p.clone();
             page = page.child(
-                panel(&format!("{}  ·  {}", p.name, p.kind.label())).child(
+                panel(cx, &format!("{}  ·  {}", p.name, p.kind.label())).child(
                     div()
                         .flex()
                         .gap_2()

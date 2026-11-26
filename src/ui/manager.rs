@@ -165,7 +165,7 @@ impl Home {
             .gap_4()
             .child(heading("实例管理"))
             .child(
-                panel("游戏目录").child(roots).child(
+                panel(cx, "游戏目录").child(roots).child(
                     div()
                         .flex()
                         .gap_2()
@@ -221,7 +221,7 @@ impl Home {
                 div()
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(PANEL))
+                    .bg(cx.theme().colors.surface)
                     .flex()
                     .gap_2()
                     .items_center()
@@ -237,7 +237,7 @@ impl Home {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(name.to_owned()),
                             )
-                            .child(kicker(&label)),
+                            .child(kicker(cx, &label)),
                     )
                     .child(
                         Button::new(
@@ -331,11 +331,14 @@ impl Home {
             }
         }
         if displayed == 0 {
-            page = page.child(kicker(if m.scanning {
-                "正在读取游戏目录…"
-            } else {
-                "没有找到匹配的实例"
-            }));
+            page = page.child(kicker(
+                cx,
+                if m.scanning {
+                    "正在读取游戏目录…"
+                } else {
+                    "没有找到匹配的实例"
+                },
+            ));
         }
         page.child(self.removed_panel(cx))
     }

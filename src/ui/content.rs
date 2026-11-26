@@ -104,7 +104,7 @@ impl Home {
             .flex()
             .flex_col()
             .gap_3()
-            .child(kicker(&self.instances[self.selected].name))
+            .child(kicker(cx, &self.instances[self.selected].name))
             .child(heading(t.label));
         let mut actions = div()
             .flex()
@@ -181,7 +181,7 @@ impl Home {
             }
         }
         if t.names.is_empty() {
-            return page.child(kicker("此目录还没有内容"));
+            return page.child(kicker(cx, "此目录还没有内容"));
         }
         for name in t.names.iter().skip(t.offset).take(40) {
             page = page.child(div().child(name.clone()));
@@ -480,15 +480,18 @@ impl Home {
             .flex()
             .flex_col()
             .gap_4()
-            .child(kicker(&item.name))
+            .child(kicker(cx, &item.name))
             .child(heading("组件与整合包"));
         if item.external.is_none() {
-            let mut components = panel("修改加载器").child(kicker(&format!(
-                "Minecraft {} · 当前 {} {}",
-                item.version,
-                item.loader.label(),
-                item.loader_version.as_deref().unwrap_or("")
-            )));
+            let mut components = panel(cx, "修改加载器").child(kicker(
+                cx,
+                &format!(
+                    "Minecraft {} · 当前 {} {}",
+                    item.version,
+                    item.loader.label(),
+                    item.loader_version.as_deref().unwrap_or("")
+                ),
+            ));
             let mut row = div().flex().flex_wrap().gap_2();
             for (i, loader) in [
                 Loader::Fabric,
@@ -523,11 +526,10 @@ impl Home {
                                     cx.notify();
                                 })),
                         )
-                        .child(kicker(&format!(
-                            "{} / {}",
-                            t.build_page + 1,
-                            t.builds.len().div_ceil(10)
-                        )))
+                        .child(kicker(
+                            cx,
+                            &format!("{} / {}", t.build_page + 1, t.builds.len().div_ceil(10)),
+                        ))
                         .child(
                             Button::new("comp-next", "下一页")
                                 .disabled((t.build_page + 1) * 10 >= t.builds.len() || busy)
@@ -549,7 +551,7 @@ impl Home {
                 );
             }
             page = page.child(components);
-            let mut updates = panel("整合包更新").child(
+            let mut updates = panel(cx, "整合包更新").child(
                 div()
                     .flex()
                     .gap_2()
@@ -613,9 +615,9 @@ impl Home {
             );
         }
         page.child(
-            panel("导出整合包")
+            panel(cx, "导出整合包")
                 .child(groups)
-                .child(kicker("选中的文件会打入包中，请确认允许分享这些文件。"))
+                .child(kicker(cx, "选中的文件会打入包中，请确认允许分享这些文件。"))
                 .child(
                     Button::new("export-pack", "导出 .mrpack")
                         .disabled(busy)
