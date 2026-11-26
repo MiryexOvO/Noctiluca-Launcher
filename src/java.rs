@@ -139,7 +139,7 @@ fn choose_installed(
         if major == required {
             return Some((major, path));
         }
-        if major > required && best.as_ref().is_none_or(|(v, _)| major < *v) {
+        if required != 8 && major > required && best.as_ref().is_none_or(|(v, _)| major < *v) {
             best = Some((major, path));
         }
     }
@@ -164,6 +164,10 @@ pub fn select(
     {
         let detected =
             version_of(&java).with_context(|| format!("无法执行所选 Java：{}", java.display()))?;
+        ensure!(
+            major != 8 || detected == 8,
+            "此旧版游戏需要 Java 8，所选版本为 {detected}"
+        );
         ensure!(
             detected >= major,
             "此版本至少需要 Java {major}，所选版本为 {detected}"

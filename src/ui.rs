@@ -9,6 +9,7 @@ mod local_mods;
 mod local_resources;
 mod manager;
 mod motion;
+mod organize;
 mod pack_import;
 mod pack_tasks;
 mod players;
@@ -47,6 +48,7 @@ use crate::{
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Library,
+    Organize,
     LocalResources,
     WorldHistory,
     Memory,
@@ -85,6 +87,7 @@ pub struct Home {
     navigation: motion::Navigation,
     _motion_preference: Subscription,
     manager: manager::Manager,
+    organizer: organize::Organizer,
     hub: hub::Hub,
     fields: settings::Fields,
     focus: FocusHandle,
@@ -174,11 +177,16 @@ impl Home {
             _motion_preference: cx.observe_window_activation(window, |home, window, cx| {
                 if window.is_window_active() {
                     motion::sync_preference(cx);
+                    if let Ok(data) = crate::organization::Organization::read(&home.root) {
+                        home.organizer.data = data;
+                        cx.notify();
+                    }
                     home.activate_clipboard(cx);
                 }
             }),
             launch_after_login: None,
             login_cancel: None,
+            organizer: organize::Organizer::new(&root, window, cx),
             manager: manager::Manager::new(&root, window, cx),
             hub: hub::Hub::new(window, cx),
             fields: settings::Fields::new(window, cx),
@@ -215,7 +223,7 @@ impl Home {
             _query_subscription: subscription,
         };
         let args: Vec<_> = std::env::args().skip(1).collect();
-        if let [flag, id] = args.as_slice()
+        if let [flag, id, ..] = args.as_slice()
             && flag == "--launch"
         {
             if let Some(index) = home.instances.iter().position(|i| &i.id == id) {
@@ -324,6 +332,11 @@ impl Home {
                     .update(cx, |home, cx| {
                         match update {
                             Update::Started(id, pid) => {
+                                if let Ok(data) =
+                                    crate::organization::Organization::read(&home.root)
+                                {
+                                    home.organizer.data = data;
+                                }
                                 home.running.insert(id, pid);
                                 if crate::preferences::current().visibility == 1 {
                                     home.prefs.minimize = true;
@@ -494,6 +507,7 @@ impl Home {
 
     fn sidebar(
         &self,
+        order: &[usize],
         frame: motion::Frame,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -531,7 +545,8 @@ impl Home {
                         ),
                 )
             });
-        for (idx, item) in self.instances.iter().enumerate() {
+        for &idx in order {
+            let item = &self.instances[idx];
             let selected = idx == self.selected && matches!(self.page, Page::Detail);
             let image = window
                 .use_asset::<project_icon::InstanceIcon>(&(self.root.clone(), item.id.clone()), cx)
@@ -582,7 +597,18 @@ impl Home {
                                     .tooltip(ely_gpui_component::primitives::Tooltip::text(
                                         item.name.clone(),
                                     ))
-                                    .child(item.name.clone()),
+                                    .child(
+                                        if self
+                                            .organizer
+                                            .data
+                                            .get(&item.id)
+                                            .is_some_and(|v| v.pinned)
+                                        {
+                                            format!("★  {}", item.name)
+                                        } else {
+                                            item.name.clone()
+                                        },
+                                    ),
                             )
                             .child(
                                 div()
@@ -1353,10 +1379,11 @@ impl Render for Home {
         if self.page != Page::Accounts {
             self.launch_after_login = None;
         }
+        let order = self.organizer.data.order(&self.instances);
         let frame = self.navigation.frame(
             motion::Destination {
                 page: self.page,
-                instance: self.selected,
+                instance: order.iter().position(|&i| i == self.selected).unwrap_or(0),
                 packs: matches!(self.page, Page::Hub) && self.hub.is_pack(),
             },
             cx.theme().reduced_motion,
@@ -1387,6 +1414,7 @@ impl Render for Home {
                 ))
                 .into_any_element(),
             Page::Files => self.files_page(cx).into_any_element(),
+            Page::Organize => self.organize_page(cx).into_any_element(),
             Page::Library => self.manager_page(cx).into_any_element(),
             Page::Hub => self.hub_page(cx).into_any_element(),
             Page::Detail => self
@@ -1426,7 +1454,7 @@ impl Render for Home {
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.sidebar(frame, window, cx))
+                    .child(self.sidebar(&order, frame, window, cx))
                     .child(
                         div()
                             .flex_1()

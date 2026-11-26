@@ -175,7 +175,19 @@ fn portable_data(dir: &Path) -> Result<PathBuf> {
 }
 
 pub fn data_root() -> Result<PathBuf> {
-    let path = match crate::setting("HOME") {
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    let explicit = match args.as_slice() {
+        [flag, id, option, path]
+            if flag == "--launch"
+                && id.to_str().is_some_and(safe_id)
+                && option == "--data-dir"
+                && Path::new(path).is_absolute() =>
+        {
+            Some(path.clone())
+        }
+        _ => None,
+    };
+    let path = match explicit.or_else(|| crate::setting("HOME")) {
         Some(path) => std::path::absolute(path)?,
         None => portable_data(env::current_exe()?.parent().context("找不到程序目录")?)?,
     };

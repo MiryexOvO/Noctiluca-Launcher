@@ -1,3 +1,4 @@
+mod mod_check;
 use crate::{
     library::{self, Instance},
     packs,
@@ -44,6 +45,7 @@ pub(crate) struct Row {
     pub ambiguous: bool,
     pub skip: bool,
     pub replace: bool,
+    pub check: Option<mod_check::Check>,
     source_hash: String,
     destinations: Vec<(Kind, Option<String>)>,
 }
@@ -54,8 +56,14 @@ impl Row {
             .find(|(k, _)| Some(*k) == self.kind)
             .and_then(|(_, v)| v.as_deref())
     }
+    fn output(&self) -> &str {
+        self.check.as_ref().map_or(&self.name, |c| &c.output)
+    }
+    pub fn blocked(&self) -> bool {
+        self.check.as_ref().is_some_and(|c| c.blocked)
+    }
     pub fn conflict(&self) -> bool {
-        self.existing().is_some()
+        self.existing().is_some() || self.check.as_ref().is_some_and(|c| c.old.is_some())
     }
     pub fn select(&mut self, kind: Kind) {
         self.kind = Some(kind);
@@ -161,6 +169,7 @@ pub(crate) fn preview(
     let game = item.game_dir(root)?;
     let mut rows = Vec::new();
     let mut dirs = Vec::<(Kind, PathBuf)>::new();
+    let mut inventory = None;
     for path in paths {
         let name = path
             .file_name()
@@ -175,6 +184,7 @@ pub(crate) fn preview(
             return Ok(Drop::Pack(path.clone()));
         };
         let mut destinations = vec![];
+        let mut check = None;
         for &candidate in kind
             .as_ref()
             .map_or(&[Kind::Resource, Kind::Shader][..], std::slice::from_ref)
@@ -185,7 +195,22 @@ pub(crate) fn preview(
                 dirs.push((candidate, resolved_dir(&game.join(candidate.dir()))?));
                 &dirs.last().unwrap().1
             };
-            destinations.push((candidate, fingerprint(dir, &name)?));
+            if candidate == Kind::Mod {
+                if inventory.is_none() {
+                    inventory = Some(crate::mods::local::inventory(dir)?);
+                }
+                check = Some(mod_check::Check::inspect(
+                    path,
+                    &name,
+                    dir,
+                    item,
+                    inventory.as_deref().unwrap(),
+                )?);
+            }
+            destinations.push((
+                candidate,
+                fingerprint(dir, check.as_ref().map_or(&name, |c| &c.output))?,
+            ));
         }
         let mut row = Row {
             path: path.clone(),
@@ -194,10 +219,11 @@ pub(crate) fn preview(
             ambiguous: kind.is_none(),
             skip: false,
             replace: false,
+            check,
             source_hash: sha1_file(path)?,
             destinations,
         };
-        row.skip = row.conflict();
+        row.skip = row.conflict() || row.blocked();
         rows.push(row);
     }
     use crate::market;
@@ -238,7 +264,14 @@ impl Plan {
 
     pub fn selection(&self) -> Result<usize> {
         let mut seen = HashSet::new();
+        let mut ids = HashSet::new();
         for row in self.rows.iter().filter(|r| !r.skip) {
+            ensure!(!row.blocked(), "{} 与当前实例不兼容", row.name);
+            if let Some(c) = &row.check {
+                for id in &c.ids {
+                    ensure!(ids.insert(id), "多个拖入文件都提供 {id}，请只选择一个");
+                }
+            }
             let kind = row.kind.context("请为未识别的 ZIP 选择类型，或跳过它")?;
             ensure!(
                 seen.insert((kind.dir(), row.name.to_lowercase())),
@@ -261,14 +294,39 @@ impl Plan {
         let current: Instance =
             serde_json::from_reader(File::open(self.item.path(root).join("instance.json"))?)?;
         ensure!(
-            current.id == self.item.id && current.game_dir(root)? == self.game,
+            current.id == self.item.id
+                && current.game_dir(root)? == self.game
+                && current.version == self.item.version
+                && current.loader == self.item.loader,
             "实例位置已变更，请重新拖入文件"
         );
+        // Different instances can point their mods directories at the same Windows junction.
+        let _mods_lock = if self
+            .rows
+            .iter()
+            .any(|r| !r.skip && r.kind == Some(Kind::Mod))
+        {
+            let dir = self.target(Kind::Mod)?;
+            fs::create_dir_all(dir)?;
+            Some(crate::game::lock_file(
+                &dir.join(".noctiluca-import.lock"),
+                "另一个实例正在导入模组，请重试",
+            )?)
+        } else {
+            None
+        };
         let mut staged = Vec::new();
+        let mut inventory = None;
         for row in self.rows.iter().filter(|r| !r.skip) {
             let kind = row.kind.context("请选择资源类型")?;
             let dir = self.target(kind)?;
-            let current = fingerprint(dir, &row.name)?;
+            if let Some(c) = &row.check {
+                if inventory.is_none() {
+                    inventory = Some(crate::mods::local::inventory(dir)?);
+                }
+                c.validate(dir, inventory.as_deref().unwrap(), &row.source_hash)?;
+            }
+            let current = fingerprint(dir, row.output())?;
             if current.as_ref() == Some(&row.source_hash) {
                 continue;
             }
@@ -302,9 +360,30 @@ impl Plan {
 
     fn publish(&self, tmp: tempfile::NamedTempFile, kind: Kind, row: &Row) -> Result<()> {
         let dir = self.target(kind)?;
-        let dest = dir.join(&row.name);
-        if fingerprint(dir, &row.name)?.as_deref() != row.existing() {
+        let dest = dir.join(row.output());
+        if fingerprint(dir, row.output())?.as_deref() != row.existing() {
             bail!("目标已变更，请重新检查：{}", row.name)
+        }
+        if let Some(old) = row
+            .check
+            .as_ref()
+            .and_then(|c| c.old.as_ref())
+            .filter(|old| !old.name.eq_ignore_ascii_case(row.output()))
+        {
+            ensure!(
+                row.replace
+                    && row.existing().is_none()
+                    && fingerprint(dir, &old.name)?.as_ref() == Some(&old.hash),
+                "原模组或目标文件已变化"
+            );
+            let previous = dir.join(&old.name);
+            // Keep exactly one loadable JAR even if the process stops between rename and replacement.
+            mod_check::move_new(&previous, &dest)?;
+            if let Err(e) = tmp.persist(&dest) {
+                mod_check::move_new(&dest, &previous).context("旧版仍在新文件名下，请重新检查")?;
+                return Err(e.error.into());
+            }
+            return Ok(());
         }
         if row.replace && row.conflict() {
             tmp.persist(&dest)?;

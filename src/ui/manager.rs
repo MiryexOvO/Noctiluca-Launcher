@@ -182,7 +182,8 @@ impl Home {
                         ),
                 ),
             )
-            .child(Input::new(&m.query));
+            .child(Input::new(&m.query))
+            .when(m.folder.is_none(), |page| page.child(self.group_filter(cx)));
         if let Some(error) = &m.error {
             page = page.child(div().text_color(rgb(0xffb5c5)).child(error.clone()));
         }
@@ -193,6 +194,7 @@ impl Home {
                 .contains(&query)
         };
         let mut displayed = 0;
+        let order = self.organizer.data.order(&self.instances);
         for (group, loader) in [
             Loader::NeoForge,
             Loader::Forge,
@@ -259,10 +261,19 @@ impl Home {
                     )
             };
             if m.folder.is_none() {
-                for (i, item) in self.instances.iter().enumerate().filter(|(_, i)| {
-                    i.loader == loader
-                        && matches(&i.name, &i.version, loader, i.loader_version.as_deref())
-                }) {
+                for (i, item) in order
+                    .iter()
+                    .copied()
+                    .map(|i| (i, &self.instances[i]))
+                    .filter(|(_, i)| {
+                        self.organizer
+                            .filter
+                            .as_ref()
+                            .is_none_or(|g| self.organizer.data.group(&i.id) == g)
+                            && i.loader == loader
+                            && matches(&i.name, &i.version, loader, i.loader_version.as_deref())
+                    })
+                {
                     let info = self
                         .running
                         .get(&item.id)

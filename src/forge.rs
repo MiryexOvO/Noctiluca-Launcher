@@ -1,3 +1,4 @@
+mod legacy;
 use crate::{
     download::Downloads,
     java,
@@ -106,9 +107,15 @@ pub fn install(
             url,
             destination: jar.clone(),
             checksum: Some(Checksum::Sha1(sha1.to_ascii_lowercase())),
-            label: build,
+            label: build.clone(),
         }],
     )?;
+    if instance.loader == Loader::Forge
+        && mc == "1.12.2"
+        && let Some(profile) = legacy::extract(&jar, shared, mc, &build, &id)?
+    {
+        return Ok(profile);
+    }
     let profiles = shared.join("launcher_profiles.json");
     if !profiles.exists() {
         atomic_write(&profiles, br#"{"profiles":{}}"#)?;

@@ -150,13 +150,13 @@ impl Home {
                     Button::new(
                         ("drop-keep", i),
                         if row.conflict() {
-                            "替换同名文件"
+                            "替换旧文件"
                         } else {
                             "安装"
                         },
                     )
                     .when(enabled && row.kind.is_some(), |b| b.primary())
-                    .disabled(busy || row.kind.is_none())
+                    .disabled(busy || row.kind.is_none() || row.blocked())
                     .on_click(cx.listener(move |h, _, _, cx| {
                         if let Some(p) = &mut h.local_drop {
                             let r = &mut p.rows[i];
@@ -168,7 +168,7 @@ impl Home {
                 );
             let kind = row.kind.map_or("请选择 ZIP 类型", Kind::label);
             let desc = if row.conflict() {
-                format!("{kind}  ·  已有同名文件")
+                format!("{kind}  ·  已有匹配文件")
             } else {
                 kind.to_string()
             };
@@ -182,6 +182,10 @@ impl Home {
                     .bg(cx.theme().colors.surface)
                     .child(row.name.clone())
                     .child(kicker(cx, &desc))
+                    .when_some(
+                        row.check.as_ref().filter(|c| !c.note.is_empty()),
+                        |el, c| el.child(kicker(cx, &c.note)),
+                    )
                     .child(buttons),
             );
         }

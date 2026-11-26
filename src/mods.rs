@@ -1,4 +1,5 @@
 pub(crate) mod local;
+mod versions;
 use anyhow::{Context, Result, bail, ensure};
 use mc_launcher_core::{
     io::hash::sha1_file,

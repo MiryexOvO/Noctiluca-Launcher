@@ -68,6 +68,13 @@ impl Home {
                 Home::open_settings,
             ),
             (
+                "organize",
+                "整理实例",
+                IconName::SlidersHorizontal,
+                true,
+                Home::open_organize,
+            ),
+            (
                 "open-backups",
                 "备份与克隆",
                 IconName::History,

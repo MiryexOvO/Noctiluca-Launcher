@@ -61,11 +61,15 @@ pub fn catalog(root: &Path, refresh: bool) -> Result<Vec<Entry>> {
         atomic_write(&index, &serde_json::to_vec(&manifest)?)?;
         manifest
     };
-    // Older releases require the legacy assets layout and authentication arguments.
+    // These two older releases use Java 8 and the hashed asset-object layout.
     Ok(manifest
         .versions
         .into_iter()
-        .filter(|v| v.released.as_str() >= "2021-06-08" && safe_id(&v.id))
+        .filter(|v| {
+            safe_id(&v.id)
+                && (v.released.as_str() >= "2021-06-08"
+                    || matches!(v.id.as_str(), "1.12.2" | "1.16.5"))
+        })
         .collect())
 }
 
@@ -87,7 +91,7 @@ fn version(
     let entry = entries
         .iter()
         .find(|v| &v.id == base)
-        .context("官方版本列表中找不到这个版本（支持 1.17 起的版本）")?;
+        .context("官方版本列表中找不到这个版本（支持 1.12.2、1.16.5 和 1.17 起的版本）")?;
     downloads.batch(
         shared,
         "版本文件",
@@ -423,6 +427,11 @@ fn prepare_and_play(
         );
     }
     drop(install_lock);
+    if let Err(e) = crate::organization::Organization::edit(root, &instance.id, |v| {
+        v.played = chrono::Utc::now().timestamp_millis()
+    }) {
+        let _ = writeln!(journal, "最近游玩记录：{e}");
+    }
     report(format!("游戏已启动 · PID {}", child.id()));
     writeln!(journal, "PID {}", child.id())?;
     let exit = child.wait()?;
