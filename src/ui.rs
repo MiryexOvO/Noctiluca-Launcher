@@ -816,8 +816,8 @@ impl Home {
             .when_some(self.issues.get(&item.id), |el, issue| {
                 el.child(self.issue_panel(issue, busy, cx))
             })
-            .child(frame.section(self.memory_panel(busy, cx), 2))
-            .child(frame.section(self.instance_panel(wide, busy, cx), 3))
+            .child(frame.section(self.instance_panel(wide, busy, cx), 2))
+            .child(frame.section(self.memory_panel(busy, cx), 3))
     }
 
     fn issue_panel(&self, issue: &crate::logs::Issue, busy: bool, cx: &Context<Self>) -> Div {
